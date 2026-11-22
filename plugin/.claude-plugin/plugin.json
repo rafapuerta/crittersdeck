@@ -1,0 +1,22 @@
+{
+  "name": "crittersdeck",
+  "version": "0.1.0",
+  "description": "Report this machine's Claude Code sessions to a crittersdeck board, and answer permission prompts from the board.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/rafapuerta/crittersdeck",
+  "userConfig": {
+    "ingest_url": {
+      "type": "string",
+      "title": "Board ingest URL",
+      "description": "The board's ingest address, e.g. https://crittersdeck-ingest.example.com (without /ingest).",
+      "required": true
+    },
+    "token": {
+      "type": "string",
+      "title": "Source token",
+      "description": "The token the board showed when you added this source.",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}

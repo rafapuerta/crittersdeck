@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>crittersdeck</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1 class="brand"><img class="brand-mark" src="favicon.svg" alt="">crittersdeck</h1>
+    <p id="link-state" class="link-state" role="status" hidden></p>
+    <nav class="top-actions" id="top-actions" hidden aria-label="Board">
+      <button type="button" id="motion-toggle" class="btn ghost">Pause motion</button>
+      <button type="button" id="open-sources" class="btn ghost">Sources</button>
+      <button type="button" id="sign-out" class="btn ghost">Sign out</button>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section id="login-view" class="login" hidden aria-labelledby="login-title">
+      <h2 id="login-title">Sign in</h2>
+      <form id="login-form" class="stack">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required aria-describedby="login-error">
+        <p id="login-error" class="error" role="alert"></p>
+        <button type="submit" class="btn primary">Sign in</button>
+      </form>
+    </section>
+
+    <div id="board-view" hidden>
+      <section class="needs" aria-labelledby="needs-title">
+        <h2 id="needs-title" class="section-title" tabindex="-1">Needs you <span id="needs-count" class="count">0</span></h2>
+        <p id="needs-empty" class="quiet">Nothing needs you. When an agent asks for permission or a question, it shows up here.</p>
+        <ul id="needs-list" class="needs-list" role="list"></ul>
+      </section>
+
+      <section class="deck" aria-labelledby="deck-title">
+        <h2 id="deck-title" class="visually-hidden">Sessions</h2>
+        <div id="deck-empty" class="empty" hidden>
+          <h3>No critters yet</h3>
+          <p>Add a source for each Claude account or machine, paste its hooks into that machine's Claude Code <code>settings.json</code>, and its sessions appear here.</p>
+          <button type="button" id="empty-add" class="btn primary">Add a source</button>
+        </div>
+        <div id="groups"></div>
+      </section>
+    </div>
+  </main>
+
+  <output id="toast" class="toast"></output>
+
+  <dialog id="detail-dialog" aria-labelledby="detail-title" closedby="any">
+    <h2 id="detail-title"></h2>
+    <dl id="detail-body" class="facts"></dl>
+    <form id="rename-form" class="row wrap">
+      <label class="grow">Title <input id="rename-input" maxlength="80" placeholder="Name this session"></label>
+      <button type="submit" class="btn">Save title</button>
+    </form>
+    <form method="dialog" class="row end wrap">
+      <button type="button" id="detail-forget" class="btn danger-ghost">Forget session</button>
+      <button type="button" id="detail-seen" class="btn">Mark as seen</button>
+      <button value="close" class="btn primary" autofocus>Close</button>
+    </form>
+  </dialog>
+
+  <dialog id="sources-dialog" aria-labelledby="sources-title" closedby="any">
+    <h2 id="sources-title">Sources</h2>
+    <p class="quiet">A source is one Claude account or machine. Each one has its own token and colour.</p>
+    <ul id="sources-list" class="sources-list" role="list"></ul>
+    <form id="source-form" class="stack">
+      <h3>Add a source</h3>
+      <div class="row wrap">
+        <label class="grow">Name <input name="name" maxlength="40" required placeholder="work laptop"></label>
+        <label>Colour <input name="color" type="color" value="#4f8cff"></label>
+      </div>
+      <p id="source-error" class="error" role="alert"></p>
+      <button type="submit" class="btn primary">Create</button>
+    </form>
+    <div id="source-created" class="created" hidden>
+      <h3 id="created-title" tabindex="-1">Connect that machine</h3>
+      <div id="install-block">
+        <p>Run these two commands in a terminal on that machine (Windows: PowerShell or cmd). The token is shown only now.</p>
+        <pre id="install-snippet" tabindex="0" aria-label="Install commands"></pre>
+        <button type="button" id="copy-install" class="btn">Copy commands</button>
+        <p class="small quiet">Rather not have the token in your shell history? Run the second command without the two <code>--config</code> parts and Claude Code asks for the values. To disconnect the machine later: <code>claude plugin uninstall crittersdeck@crittersdeck</code>.</p>
+      </div>
+      <p class="warn">That machine will send every session event to this board, including the tool input: commands, file paths and sometimes file contents. The board keeps only a short summary.</p>
+      <p id="source-no-public-url" class="warn" hidden>The URL below is this board's own address, because <code>CRITTERSDECK_PUBLIC_URL</code> is not set. Machines elsewhere need the public ingest address instead.</p>
+      <p id="source-insecure" class="warn" hidden><strong>This address is not HTTPS.</strong> Outside your own network, events (and the token) would travel in clear text. Set <code>CRITTERSDECK_PUBLIC_URL</code> to an https address.</p>
+      <details id="manual-block">
+        <summary>Or set it up by hand in settings.json</summary>
+        <p>Merge this into <code>~/.claude/settings.json</code> (Windows: <code>%USERPROFILE%\.claude\settings.json</code>).</p>
+        <pre id="source-snippet" tabindex="0" aria-label="Hooks for settings.json"></pre>
+        <button type="button" id="copy-snippet" class="btn">Copy</button>
+      </details>
+    </div>
+    <form method="dialog" class="row end">
+      <button value="close" class="btn">Done</button>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <form method="dialog" class="row end">
+      <button value="cancel" class="btn" autofocus>Cancel</button>
+      <button value="confirm" class="btn danger" id="confirm-ok">Delete</button>
+    </form>
+  </dialog>
+</body>
+</html>

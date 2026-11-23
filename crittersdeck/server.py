@@ -28,6 +28,7 @@ from .approvals import ALLOW, DENY, Approvals, hook_reply
 from .snippet import EVENTS, TITLE_EVENT, hooks_block, install_commands
 from .store import Store
 
+ANSWER = "answer"  # answers to AskUserQuestion, from the board
 MAX_BODY = 256 * 1024
 FULL_INPUT_MAX = 4000
 NAME_MAX = 120
@@ -116,6 +117,65 @@ def readable_input(tool_input):
     if len(text) > FULL_INPUT_MAX:
         return text[:FULL_INPUT_MAX], description, False
     return text, description, True
+
+
+QUESTIONS_MAX, OPTIONS_MAX, OTHER_MAX = 8, 20, 500
+
+
+def question_form(tool_input):
+    """AskUserQuestion input as the board shows it, or None when it is not the expected shape
+    (the board then shows it as any other tool, raw)."""
+    questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
+    if not isinstance(questions, list) or not 0 < len(questions) <= QUESTIONS_MAX:
+        return None
+    shown = lambda v: "".join(map(_visible, v))
+    texts = [q.get("question") if isinstance(q, dict) else None for q in questions]
+    if len(set(map(str, texts))) != len(texts):
+        return None  # answers are keyed by the question text: repeated texts could not be told apart
+    form = []
+    for q in questions:
+        if not isinstance(q, dict) or not isinstance(q.get("question"), str) or not q["question"].strip():
+            return None
+        options = q.get("options")
+        if not isinstance(options, list) or not 0 < len(options) <= OPTIONS_MAX:
+            return None
+        if not all(isinstance(o, dict) and isinstance(o.get("label"), str) and o["label"].strip() for o in options):
+            return None
+        form.append({
+            "question": shown(q["question"]),
+            "header": shown(q["header"]) if isinstance(q.get("header"), str) else "",
+            "multi": q.get("multiSelect") is True,
+            "options": [{"label": shown(o["label"]),
+                         "description": shown(o["description"]) if isinstance(o.get("description"), str) else ""}
+                        for o in options],
+        })
+    return form
+
+
+def answered_input(tool_input, answers):
+    """The AskUserQuestion input with the board's answers, or None if they do not fit the questions.
+
+    `answers` has one entry per question: {"options": [indexes], "other": text}. A single-choice
+    question takes one option or a text of one's own; a multi-choice one, any options and/or a text."""
+    questions = tool_input["questions"]
+    if not isinstance(answers, list) or len(answers) != len(questions):
+        return None
+    out = {}
+    for q, a in zip(questions, answers):
+        if not isinstance(a, dict):
+            return None
+        picked, other = a.get("options", []), a.get("other", "")
+        if not isinstance(picked, list) or not isinstance(other, str) or len(other) > OTHER_MAX:
+            return None
+        other = " ".join(other.split())
+        n = len(q["options"])
+        if not all(type(i) is int and 0 <= i < n for i in picked) or len(set(picked)) != len(picked):
+            return None
+        chosen = [q["options"][i]["label"] for i in sorted(picked)] + ([other] if other else [])
+        if not chosen or (len(chosen) > 1 and q.get("multiSelect") is not True):
+            return None
+        out[q["question"]] = ", ".join(chosen)
+    return {**tool_input, "answers": out}
 
 
 def is_private_url(url):
@@ -252,7 +312,9 @@ def create_apps(settings=None):
             return JSONResponse({})  # no decision: the session's own dialog handles it
 
         text, description, complete = readable_input(event.get("tool_input"))
-        pending = approvals.open(sid, session_id, s["tool"], text, description, complete)
+        questions = question_form(event.get("tool_input")) if s["tool"] == "AskUserQuestion" else None
+        pending = approvals.open(sid, session_id, s["tool"], text, description, complete,
+                                 questions, event.get("tool_input") if questions else None)
         broadcast()
 
         async def wait_for_answer():
@@ -391,14 +453,26 @@ def create_apps(settings=None):
     @board.post("/api/approvals/{request_id}")
     async def decide(request_id: str, request: Request):
         require_user(request, mutating=True)
-        decision = (await json_body(request)).get("decision")
-        if decision not in (ALLOW, DENY):
-            raise HTTPException(400, "decision must be allow or deny")
+        body = await json_body(request)
+        decision = body.get("decision")
+        if decision not in (ALLOW, DENY, ANSWER):
+            raise HTTPException(400, "decision must be allow, deny or answer")
         pending = approvals.get(request_id)
         if pending is None:
             raise HTTPException(409, "this request was already answered")
-        if decision == ALLOW and not pending.complete:
+        if decision == ANSWER:
+            if not pending.questions:
+                raise HTTPException(400, "this request has no questions")
+            updated = answered_input(pending.tool_input, body.get("answers"))
+            if updated is None:
+                raise HTTPException(400, "answer every question: pick options or write your own")
+            decision = {"behavior": ALLOW, "updatedInput": updated}
+        elif decision == ALLOW and pending.questions:
+            raise HTTPException(400, "a question is answered, not allowed: send the answers")
+        elif decision == ALLOW and not pending.complete:
             raise HTTPException(409, "too long to show in full: answer it in the session")
+        elif decision == DENY and pending.questions:
+            decision = {"behavior": DENY, "message": "Skipped from crittersdeck: no answer was given."}
         approvals.decide(request_id, decision)
         s = store.session(pending.source_id, pending.session_id)
         if s is not None:  # the agent carries on (or is told no): it is working again

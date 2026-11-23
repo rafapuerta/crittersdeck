@@ -517,3 +517,71 @@ async def test_title_from_claude(client):
     await client.patch(f"/api/sessions/{sid}/s1", json={"title": "Mine"})
     assert (await send(client, token, title("Claude's"))).json() == {"applied": True}  # handled: not resent
     assert (await board(client))["sessions"][0]["title"] == "Mine"
+
+
+ASK = {"questions": [
+    {"question": "¿Con qué estado lo publico?", "header": "Estado", "multiSelect": False,
+     "options": [{"label": "Comment", "description": "No bloquea"}, {"label": "Approve", "description": "Listo"}]},
+    {"question": "¿Qué avisos?", "header": "Avisos", "multiSelect": True,
+     "options": [{"label": "Correo"}, {"label": "Push"}, {"label": "Ninguno"}]},
+]}
+
+
+async def test_questions_answered_from_board(client):
+    await sign_in(client)
+    token = (await new_source(client))["token"]
+    hook = asyncio.create_task(send(client, token, event("PermissionRequest", tool_name="AskUserQuestion", tool_input=ASK)))
+    rid = await pending_id(client)
+    p = (await board(client))["sessions"][0]["pending"]
+    assert [q["header"] for q in p["questions"]] == ["Estado", "Avisos"] and p["questions"][1]["multi"] is True
+    assert p["questions"][0]["options"][0] == {"label": "Comment", "description": "No bloquea"}
+    post = lambda answers: client.post(f"/api/approvals/{rid}", json={"decision": "answer", "answers": answers})
+    bad = [
+        None, [],
+        [{"options": [0]}],  # one question unanswered
+        [{"options": [0, 1]}, {"options": [0]}],  # two options on a single-choice question
+        [{"options": [5]}, {"options": [0]}],  # no such option
+        [{"options": [0], "other": "y"}, {"options": [0]}],  # option and own text on a single-choice question
+        [{"options": []}, {"options": [0]}],  # nothing chosen
+        [{"other": "   "}, {"options": [0]}],
+        [{"options": [True]}, {"options": [0]}],
+        [{"options": [0]}, {"options": [1, 1]}],
+        [{"other": "x" * 501}, {"options": [0]}],
+    ]
+    for answers in bad:
+        assert (await post(answers)).status_code == 400, answers
+    assert (await client.post(f"/api/approvals/{rid}", json={"decision": "allow"})).status_code == 400  # not unanswered
+    assert (await post([{"other": "  Como  borrador "}, {"options": [1, 0], "other": "y DevOps"}])).status_code == 200
+    decision = (await hook).json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert decision["updatedInput"]["questions"] == ASK["questions"]
+    assert decision["updatedInput"]["answers"] == {"¿Con qué estado lo publico?": "Como borrador", "¿Qué avisos?": "Correo, Push, y DevOps"}
+    assert (await post([{"options": [0]}, {"options": [0]}])).status_code == 409  # answered once
+
+
+async def test_questions_can_be_skipped_and_odd_shapes_stay_raw(client):
+    await sign_in(client)
+    token = (await new_source(client))["token"]
+    hook = asyncio.create_task(send(client, token, event("PermissionRequest", tool_name="AskUserQuestion", tool_input=ASK)))
+    rid = await pending_id(client)
+    assert (await client.post(f"/api/approvals/{rid}", json={"decision": "deny"})).status_code == 200
+    skipped = (await hook).json()["hookSpecificOutput"]["decision"]
+    assert skipped["behavior"] == "deny" and "Skipped" in skipped["message"]
+    # Not the expected shape: shown raw like any tool, and it cannot be "answered".
+    odd = {"questions": [{"question": "x", "options": "nope"}]}
+    hook = asyncio.create_task(send(client, token, event("PermissionRequest", tool_name="AskUserQuestion", tool_input=odd)))
+    rid = await pending_id(client)
+    p = (await board(client))["sessions"][0]["pending"]
+    assert p["questions"] is None and '"nope"' in p["input"]
+    r = await client.post(f"/api/approvals/{rid}", json={"decision": "answer", "answers": [{"options": [0]}]})
+    assert r.status_code == 400
+    # Another tool's input that looks like questions is never offered as a form.
+    await client.post(f"/api/approvals/{rid}", json={"decision": "deny"})
+    await hook
+    hook = asyncio.create_task(send(client, token, event("PermissionRequest", tool_name="Bash", tool_input=ASK)))
+    await pending_id(client)
+    assert (await board(client))["sessions"][0]["pending"]["questions"] is None
+    hook.cancel()
+    twice = {"questions": [ASK["questions"][0], ASK["questions"][0]]}  # same text twice: answers would collide
+    from crittersdeck.server import question_form
+    assert question_form(twice) is None and question_form(ASK) is not None

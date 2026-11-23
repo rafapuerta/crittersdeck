@@ -1,7 +1,7 @@
 {
   "name": "crittersdeck",
-  "version": "0.1.0",
-  "description": "Report this machine's Claude Code sessions to a crittersdeck board, and answer permission prompts from the board.",
+  "version": "0.2.0",
+  "description": "Report this machine's Claude Code sessions to a crittersdeck board, answer permission prompts and questions from the board, and (optionally) send each session's title and usage.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/rafapuerta/crittersdeck",
   "userConfig": {
@@ -17,6 +17,13 @@
       "description": "The token the board showed when you added this source.",
       "required": true,
       "sensitive": true
+    },
+    "send_usage": {
+      "type": "boolean",
+      "title": "Send titles and usage",
+      "description": "Send Claude's title for each session and its usage (context, tokens, cost, model; never prompt text). Reads this machine's Claude sign-in for sessions linked to claude.ai, and needs python3. Turn it off to send only session events.",
+      "required": false,
+      "default": true
     }
   }
 }

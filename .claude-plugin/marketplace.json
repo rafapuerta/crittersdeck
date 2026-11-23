@@ -8,6 +8,11 @@
       "name": "crittersdeck",
       "source": "./plugin",
       "description": "Report this machine's Claude Code sessions to a crittersdeck board, and answer permission prompts from the board."
+    },
+    {
+      "name": "crittersdeck-titles",
+      "source": "./plugin-titles",
+      "description": "Show crittersdeck sessions with the titles Claude gives them. Reads this machine's Claude sign-in to ask claude.ai (an undocumented API). Needs python3."
     }
   ]
 }

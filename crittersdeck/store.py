@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT NOT NULL,
     folder TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
+    renamed INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     tool TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 """
 
-_SESSION_FIELDS = ("folder", "title", "status", "tool", "detail", "started", "updated")
+_SESSION_FIELDS = ("folder", "title", "renamed", "status", "tool", "detail", "started", "updated")
 
 
 def hash_token(token):
@@ -44,6 +45,8 @@ class Store:
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(sessions)")}
         if "title" not in columns:  # databases from before session titles
             self.db.execute("ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        if "renamed" not in columns:  # databases from before titles from Claude
+            self.db.execute("ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0")
 
     # ---- sources ---------------------------------------------------------
 
@@ -82,12 +85,13 @@ class Store:
         return dict(row) if row else None
 
     def save_session(self, source_id, session_id, s):
-        values = [s.get(f, "") for f in _SESSION_FIELDS]
+        values = [s.get(f, 0 if f == "renamed" else "") for f in _SESSION_FIELDS]
         with self.db:
             self.db.execute(
-                "INSERT INTO sessions (source_id, session_id, folder, title, status, tool, detail, started, updated)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO sessions (source_id, session_id, folder, title, renamed, status, tool, detail, started, updated)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT (source_id, session_id) DO UPDATE SET folder = excluded.folder, title = excluded.title,"
+                " renamed = excluded.renamed,"
                 " status = excluded.status, tool = excluded.tool, detail = excluded.detail,"
                 " updated = excluded.updated",
                 [source_id, session_id, *values],

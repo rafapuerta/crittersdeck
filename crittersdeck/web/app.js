@@ -210,8 +210,13 @@ function critter(status, color, tool = "", folder = "", solid = true) {
   return root;
 }
 
+// MCP tools are named mcp__<server>__<tool>: the tool part is what says what it does.
+function toolName(tool) {
+  return tool.startsWith("mcp__") ? tool.split("__").slice(2).join("__") || tool : tool;
+}
+
 function statusLine(s) {
-  if (s.status === "working") return ACTIVITY[signFor("working", s.tool)[0]] + (s.tool ? ` · ${s.tool}` : "");
+  if (s.status === "working") return ACTIVITY[signFor("working", s.tool)[0]] + (s.tool ? ` · ${toolName(s.tool)}` : "");
   if (s.status === "needs_you") {
     if (!s.pending) return "has a question";
     return s.pending.questions ? "has a question" : `allow ${s.pending.tool || "a tool"}?`;

@@ -4,7 +4,7 @@ A status board for your Claude Code sessions, across accounts and machines. Ever
 
 - **Any account, any machine.** Add a *source* for each Claude account or computer (personal, work, a server...). Each one gets its own token and colour.
 - **Any way you run Claude Code.** Sessions report through Claude Code's own HTTP hooks, so the terminal, the desktop app, the web, Remote Control and multiplexers all show up the same way. Nothing to install on the machines that run the agents.
-- **Unblock sessions from the board.** A permission prompt shows in the session *and* on the board at the same time. Whichever answers first wins; there is no time limit.
+- **Unblock sessions from the board.** A permission prompt shows in the session *and* on the board at the same time. Whichever answers first wins; there is no time limit. Questions with options (`AskUserQuestion`) work the same way: pick the options, or write your own answer, on the board.
 
 | Critter | Means |
 |---|---|
@@ -100,7 +100,6 @@ Connecting a machine means trusting the board with it: whoever can answer at the
 
 ## Limits
 
-- Questions with options (`AskUserQuestion`) are shown as *needs you*, but they are answered in the session: they do not go through a hook.
 - Context use and cost are not shown: they live in the local transcript, which the hooks do not send.
 - Claude Code only. Other agents are not supported yet.
 - Requests are tracked per session: if a subagent of the same session uses a tool while a request is open, the board withdraws it (the session's own dialog still has it).

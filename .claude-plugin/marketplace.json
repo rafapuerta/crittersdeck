@@ -12,7 +12,7 @@
     {
       "name": "crittersdeck-titles",
       "source": "./plugin-titles",
-      "description": "Show crittersdeck sessions with the titles Claude gives them. Reads this machine's Claude sign-in to ask claude.ai (an undocumented API). Needs python3."
+      "description": "Show crittersdeck sessions with the titles Claude gives them and their usage (context, tokens, cost, model). Reads this machine's Claude sign-in to ask claude.ai (an undocumented API). Needs python3."
     }
   ]
 }

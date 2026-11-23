@@ -1,7 +1,7 @@
 {
   "name": "crittersdeck-titles",
-  "version": "0.1.0",
-  "description": "Show crittersdeck sessions with the titles Claude gives them. Reads this machine's Claude sign-in to ask claude.ai (an undocumented API). Needs python3.",
+  "version": "0.2.0",
+  "description": "Show crittersdeck sessions with the titles Claude gives them and their usage (context, tokens, cost, model). Reads this machine's Claude sign-in to ask claude.ai (an undocumented API). Needs python3.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/rafapuerta/crittersdeck",
   "userConfig": {

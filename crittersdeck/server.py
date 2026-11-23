@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, state
 from .approvals import ALLOW, DENY, Approvals, hook_reply
-from .snippet import EVENTS, hooks_block, install_commands
+from .snippet import EVENTS, TITLE_EVENT, hooks_block, install_commands
 from .store import Store
 
 MAX_BODY = 256 * 1024
@@ -224,10 +224,12 @@ def create_apps(settings=None):
         if not isinstance(session_id, str) or not _SESSION_ID.match(session_id):
             return JSONResponse({"error": "missing or bad session_id"}, status_code=400)
         name = event.get("hook_event_name")
+        sid = source["id"]
+        if name == TITLE_EVENT:
+            return set_claude_title(sid, session_id, event.get("title"))
         if name not in EVENTS:
             return JSONResponse({})  # an event this version does not use
 
-        sid = source["id"]
         previous = store.session(sid, session_id)
         if previous is None and store.count_sessions(sid) >= MAX_SESSIONS_PER_SOURCE:
             evicted = store.evict_oldest(sid)
@@ -268,6 +270,24 @@ def create_apps(settings=None):
                 broadcast()
 
         return StreamingResponse(wait_for_answer(), media_type="application/json")
+
+    def set_claude_title(source_id, session_id, title):
+        """The title Claude gave the session (sent by the crittersdeck-titles plugin). It replaces the
+        first-prompt title but not a name given on the board, and does not count as activity.
+        `applied` tells the sender whether to remember it as sent."""
+        if not isinstance(title, str) or not title.strip():
+            return JSONResponse({"error": "missing title"}, status_code=400)
+        s = store.session(source_id, session_id)
+        if s is None:  # only sessions the hooks already reported
+            return JSONResponse({"applied": False})
+        title = "".join(map(_visible, " ".join(title.split())))[:NAME_MAX]
+        if not s["renamed"] and title != s["title"]:
+            try:
+                store.save_session(source_id, session_id, {**s, "title": title})
+            except sqlite3.IntegrityError:  # the source was deleted while this event was in flight
+                return JSONResponse({"error": "unknown source"}, status_code=401)
+            broadcast()
+        return JSONResponse({"applied": True})
 
     # ---- board sign-in -------------------------------------------------------
 
@@ -405,7 +425,7 @@ def create_apps(settings=None):
         s = store.session(source_id, session_id)
         if s is None:
             raise HTTPException(404, "no such session")
-        store.save_session(source_id, session_id, {**s, "title": "".join(map(_visible, " ".join(title.split())))})
+        store.save_session(source_id, session_id, {**s, "title": "".join(map(_visible, " ".join(title.split()))), "renamed": 1})
         broadcast()
         return {}
 

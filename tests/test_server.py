@@ -437,7 +437,18 @@ def test_plugin_hooks_cover_every_event():
     manifest = json.loads((root / "plugin/.claude-plugin/plugin.json").read_text())
     assert manifest["userConfig"]["token"]["sensitive"] is True
     market = json.loads((root / ".claude-plugin/marketplace.json").read_text())
-    assert market["name"] == "crittersdeck" and market["plugins"][0]["source"] == "./plugin"
+    assert market["name"] == "crittersdeck"
+    assert [(p["name"], p["source"]) for p in market["plugins"]] == [
+        ("crittersdeck", "./plugin"), ("crittersdeck-titles", "./plugin-titles")]
+    # The title step is its own plugin, so only those who install it run python3 or share their Claude sign-in.
+    titles = json.loads((root / "plugin-titles/hooks/hooks.json").read_text())["hooks"]
+    assert set(titles) == {"UserPromptSubmit", "Stop"}
+    for groups in titles.values():
+        [t] = groups[0]["hooks"]
+        assert t["command"] == "python3" and t["async"] is True  # never delays the session
+        assert t["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/titles.py", "${user_config.ingest_url}"]
+    manifest = json.loads((root / "plugin-titles/.claude-plugin/plugin.json").read_text())
+    assert manifest["userConfig"]["token"]["sensitive"] is True
 
 
 async def test_trailing_slash_base_url_still_reaches_ingest(client):
@@ -480,4 +491,29 @@ def test_old_database_gets_title_column(tmp_path):
     con.close()
     from crittersdeck.store import Store
 
-    assert Store(str(db)).session("a", "s1")["title"] == ""
+    s = Store(str(db)).session("a", "s1")
+    assert (s["title"], s["renamed"]) == ("", 0)
+
+
+async def test_title_from_claude(client):
+    await sign_in(client)
+    created = await new_source(client)
+    token, sid = created["token"], created["source"]["id"]
+    title = lambda t, session="s1": {"hook_event_name": "TitleUpdate", "session_id": session, "title": t}
+    # Never creates a session: only sessions the hooks reported get a title.
+    r = await send(client, token, title("Ghost"))
+    assert r.status_code == 200 and r.json() == {"applied": False}
+    assert (await board(client))["sessions"] == []
+    await send(client, token, event("UserPromptSubmit", prompt="fix the bug"))
+    await send(client, token, event("Stop"))
+    before = (await board(client))["sessions"][0]
+    assert (await send(client, token, title("Login\u202e   bug fix"))).json() == {"applied": True}
+    after = (await board(client))["sessions"][0]
+    assert after["title"] == "Login\\u{202e} bug fix"
+    assert (after["status"], after["updated"]) == (before["status"], before["updated"])  # not activity
+    assert (await send(client, token, title("  "))).status_code == 400
+    assert (await send(client, token, title(None))).status_code == 400
+    # A name given on the board wins over Claude's.
+    await client.patch(f"/api/sessions/{sid}/s1", json={"title": "Mine"})
+    assert (await send(client, token, title("Claude's"))).json() == {"applied": True}  # handled: not resent
+    assert (await board(client))["sessions"][0]["title"] == "Mine"

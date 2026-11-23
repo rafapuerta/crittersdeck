@@ -66,6 +66,21 @@ How the plugin works: each hook runs `curl` directly (exec form, no shell), so t
 - Only the board's answer to a permission request becomes hook output. For every other event the response is written to the plugin's data folder and ignored, so a board cannot add text to your sessions.
 - If Claude Code is killed while a permission request is open, its `curl` may keep the request on the board. Use **Forget session** on the board to clear it.
 
+### Titles from Claude (optional)
+
+By default a session is named after the first line of its first prompt, and you can rename it on the board. To show the title Claude gives each session instead (the one in the Claude app's sidebar), also install the **crittersdeck-titles** plugin, with the same values:
+
+```sh
+claude plugin install crittersdeck-titles@crittersdeck --config ingest_url=https://ingest.example.com --config token=cd_...
+```
+
+It needs `python3`. After each prompt and each reply, its script (`plugin-titles/scripts/titles.py`, run in the background so it never delays the session) finds the title and sends it to the board:
+
+- For sessions linked to claude.ai (the desktop app, the web, Remote Control) it asks claude.ai, using this machine's Claude sign-in. That API is not documented, so it can stop working with any Claude Code update; the board then keeps the first-prompt title.
+- For terminal sessions it reads the title Claude Code writes to the session's transcript.
+
+The Claude sign-in is read from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) and used only for that request to `api.anthropic.com`, which is never redirected elsewhere: the board receives the title and nothing else. It does not work where Claude Code keeps the sign-in in the system keychain (macOS); terminal sessions still work there. On a work account, check your organisation's policy before installing it. A name you give a session on the board always wins over Claude's.
+
 Start a session and its critter appears with the first event. Deleting a source on the board revokes its token at once.
 
 With the hand-made `hooks` block (Claude Code `http` hooks), note that Claude Code refuses HTTP hooks that resolve to a private address (`ERR_HTTP_HOOK_BLOCKED_ADDRESS`; loopback is allowed), so its URL must resolve to a public address on every machine. The plugin does not have this limit.
@@ -75,7 +90,7 @@ With the hand-made `hooks` block (Claude Code `http` hooks), note that Claude Co
 - **Whoever can open the board can approve commands on your machines.** Keep the board behind a password or an auth proxy, and do not publish it. Publish only the ingest listener (`--ingest-port`), which serves nothing but `POST /ingest`.
 - The board shows exactly what Allow will run: hidden characters (controls, bidi overrides, zero-width) are shown as `\u{...}`, and a request too long to show in full can only be denied on the board.
 - Limits per source: 20 events per second, 200 sessions (the quietest is dropped), 10 open permission requests (more are left to the session's own dialog).
-- Claude Code's HTTP hooks send the whole hook event, tool input included (commands, file paths, sometimes file contents). Use HTTPS for any machine outside your network. The board keeps only a short summary per session: never the full tool input, and of the prompts only the first line (60 characters at most) of each session's first prompt, as its title. Rename a session on the board to replace it. The full input of an open permission request stays in memory until it is answered.
+- Claude Code's HTTP hooks send the whole hook event, tool input included (commands, file paths, sometimes file contents). Use HTTPS for any machine outside your network. The board keeps only a short summary per session: never the full tool input, and of the prompts only the first line (60 characters at most) of each session's first prompt, as its title (or Claude's title for the session, with crittersdeck-titles). Rename a session on the board to replace it. The full input of an open permission request stays in memory until it is answered.
 - Tokens are random, stored as hashes, and only allow sending events. Events are size- and rate-limited per source.
 - Answering on the board needs a signed-in session and a CSRF token, and works once per request.
 

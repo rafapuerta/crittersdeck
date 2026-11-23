@@ -16,6 +16,14 @@ let events = null;
 let openDetailKey = null;
 let linkDown = false;
 const openEnded = new Set(); // "Ended" lists the viewer opened, kept open across re-renders
+const drafts = new Map(); // answers being picked for questions, by request id: kept across re-renders
+let composing = false;
+let renderLater = false;
+document.addEventListener("compositionstart", () => { composing = true; });
+document.addEventListener("compositionend", () => {
+  composing = false;
+  if (renderLater) { renderLater = false; render(); }
+});
 
 // ---- helpers -------------------------------------------------------------
 
@@ -204,7 +212,10 @@ function critter(status, color, tool = "", folder = "", solid = true) {
 
 function statusLine(s) {
   if (s.status === "working") return ACTIVITY[signFor("working", s.tool)[0]] + (s.tool ? ` · ${s.tool}` : "");
-  if (s.status === "needs_you") return s.pending ? `allow ${s.pending.tool || "a tool"}?` : "has a question";
+  if (s.status === "needs_you") {
+    if (!s.pending) return "has a question";
+    return s.pending.questions ? "has a question" : `allow ${s.pending.tool || "a tool"}?`;
+  }
   if (s.status === "done_unseen") return `done · ${ago(s.updated)}`; // the stripes say "not seen"
   if (s.status === "idle") return `idle · ${ago(s.updated)}`;
   if (s.status === "ended") return `ended · ${ago(s.updated)}`;
@@ -230,7 +241,9 @@ function render() {
     ? "Not connected, so this list may be out of date."
     : "Nothing needs you. When an agent asks for permission or a question, it shows up here.";
   document.title = asking.length ? `(${asking.length}) crittersdeck` : "crittersdeck";
+  if (composing) { renderLater = true; return; } // rebuilding the field would drop half-typed text
   const focused = document.activeElement?.dataset?.focus;
+  const range = [document.activeElement?.selectionStart, document.activeElement?.selectionEnd];
   $("#needs-list").replaceChildren(...asking.map((s) => needCard(s, sources.get(s.source_id))));
 
   // Deck, grouped by source
@@ -259,7 +272,12 @@ function render() {
   });
   $("#groups").replaceChildren(...groups);
   // Everything was rebuilt: put keyboard focus back where it was.
-  if (focused) document.querySelector(`[data-focus="${CSS.escape(focused)}"]`)?.focus();
+  if (focused) {
+    const again = document.querySelector(`[data-focus="${CSS.escape(focused)}"]`);
+    again?.focus();
+    if (again?.type === "text" && range[0] != null) again.setSelectionRange(...range);
+  }
+  for (const id of drafts.keys()) if (!asking.some((s) => s.pending?.id === id)) drafts.delete(id);
 
   if (openDetailKey) fillDetail();
 }
@@ -288,6 +306,7 @@ function tile(s, src) {
 
 function needCard(s, src) {
   const p = s.pending;
+  if (p?.questions) return questionCard(s, src, p);
   return el(
     "li",
     { class: p ? "need" : "need compact", style: { "--c": src.color } },
@@ -303,7 +322,7 @@ function needCard(s, src) {
       p && lineCount(p.input) ? el("p", { class: "small need-lines" }, lineCount(p.input)) : null,
       p ? el("pre", { class: "need-input", tabindex: "0", "data-focus": `pre:${p.id}`, "aria-label": "Exactly what it will run" }, ...withBreaks(p.input)) : null,
       p && !p.complete ? el("p", { class: "small" }, "Too long to show in full, so it can only be allowed in the session.") : null,
-      p ? null : el("p", { class: "small" }, "Answer it in the session; the board cannot answer questions."),
+      p ? null : el("p", { class: "small" }, "Answer it in the session: it did not come through the board's hook."),
     ),
     p
       ? el(
@@ -318,10 +337,121 @@ function needCard(s, src) {
   );
 }
 
-async function answer(id, decision) {
+// A question with options (AskUserQuestion), answered on the board. The session shows it too.
+// "Other" is one more choice, with its text field: picking it never throws away other choices.
+function questionCard(s, src, p) {
+  if (!drafts.has(p.id)) drafts.set(p.id, p.questions.map(() => ({ options: new Set(), otherOn: false, other: "", error: "" })));
+  const draft = drafts.get(p.id);
+  const fieldsets = p.questions.map((q, qi) => {
+    const d = draft[qi];
+    const name = `q-${p.id}-${qi}`;
+    const errorId = `${name}-error`;
+    const choose = (on, apply) => {
+      if (!q.multi && on) { d.options.clear(); d.otherOn = false; }
+      apply();
+      d.error = "";
+      render();
+    };
+    return el(
+      "fieldset",
+      { class: "question", "aria-describedby": d.error ? errorId : null },
+      el("legend", {}, q.header ? el("span", { class: "q-header" }, q.header) : null, el("span", { class: "q-text" }, q.question)),
+      q.multi ? el("p", { class: "small q-hint" }, "Choose one or more.") : null,
+      ...q.options.map((o, oi) =>
+        el(
+          "label",
+          { class: "q-option" },
+          el("input", {
+            type: q.multi ? "checkbox" : "radio", name, value: String(oi), checked: d.options.has(oi),
+            "data-focus": `q:${p.id}:${qi}:${oi}`,
+            onchange: (e) => {
+              const on = e.currentTarget.checked;
+              choose(on, () => (on ? d.options.add(oi) : d.options.delete(oi)));
+            },
+          }),
+          el("span", { class: "q-label" }, o.label, o.description ? el("span", { class: "q-desc" }, o.description) : null),
+        ),
+      ),
+      el(
+        "div",
+        { class: d.otherOn ? "q-option q-other" : "q-option q-other off" },
+        el("input", {
+          type: q.multi ? "checkbox" : "radio", name, value: "other", id: `${name}-other`, checked: d.otherOn,
+          "data-focus": `qr:${p.id}:${qi}`,
+          onchange: (e) => {
+            const on = e.currentTarget.checked;
+            choose(on, () => { d.otherOn = on; });
+          },
+        }),
+        el(
+          "span",
+          { class: "q-label" },
+          el("label", { for: `${name}-other` }, "Other"),
+          el("input", {
+            type: "text", maxlength: "500", autocomplete: "off", value: d.other, placeholder: "Type your own answer",
+            "aria-label": `Your own answer to: ${q.question}`, "data-focus": `qo:${p.id}:${qi}`,
+            oninput: (e) => {
+              d.other = e.currentTarget.value;
+              if (d.other.trim() && (!d.otherOn || d.error)) choose(true, () => { d.otherOn = true; }); // typing chooses "Other"
+            },
+          }),
+        ),
+      ),
+      // Only the first error is announced: focus goes there; the others are reachable by their question.
+      el("p", { class: "error small", id: errorId, role: d.error && draft.findIndex((x) => x.error) === qi ? "alert" : null }, d.error),
+    );
+  });
+  return el(
+    "li",
+    { class: "need question-need", style: { "--c": src.color } },
+    el("span", { class: "art small" }, critter("needs_you", src.color, s.tool, s.folder, false)),
+    el(
+      "form",
+      { class: "need-text", onsubmit: (e) => { e.preventDefault(); sendAnswers(p); } },
+      el("p", { class: "need-who" }, el("strong", {}, nameOf(s)), ` · ${placeOf(s)} · ${src.name}`),
+      el("p", { class: "need-what" }, p.questions.length > 1 ? "Has some questions for you" : "Has a question for you"),
+      ...fieldsets,
+      el(
+        "div",
+        { class: "need-actions" },
+        el("button", { type: "submit", class: "btn allow", "data-focus": `allow:${p.id}`, disabled: linkDown }, "Send"),
+        el("button", { type: "button", class: "btn", "data-focus": `deny:${p.id}`, disabled: linkDown, onclick: () => answer(p.id, "deny", true) }, "Skip"),
+      ),
+    ),
+  );
+}
+
+async function sendAnswers(p) {
+  const draft = drafts.get(p.id) || [];
+  for (const d of draft) {
+    const own = d.otherOn && d.other.trim();
+    d.error = d.otherOn && !own ? "Write your answer, or untick Other." : !d.options.size && !own ? "Choose an answer." : "";
+  }
+  const missing = draft.findIndex((d) => d.error);
+  if (missing >= 0) {
+    render();
+    const field = document.querySelector(`[data-focus="${CSS.escape(draft[missing].otherOn ? `qo:${p.id}:${missing}` : `q:${p.id}:${missing}:0`)}"]`);
+    field?.focus();
+    field?.closest("fieldset")?.scrollIntoView({ block: "nearest" });
+    return;
+  }
+  const answers = draft.map((d) => ({ options: [...d.options], other: d.otherOn ? d.other : "" }));
+  try {
+    await api(`/api/approvals/${encodeURIComponent(p.id)}`, { method: "POST", body: JSON.stringify({ decision: "answer", answers }) });
+    drafts.delete(p.id);
+    toast("Answer sent. The agent carries on.");
+  } catch (err) {
+    toast(err.status === 409 ? "Already answered in the session." : `Could not send the answer: ${err.message}`);
+  }
+  const next = [...document.querySelectorAll("#needs-list .need-actions .btn")].find((b) => !b.dataset.focus.endsWith(`:${p.id}`));
+  (next || $("#needs-title")).focus();
+}
+
+async function answer(id, decision, question = false) {
   try {
     await api(`/api/approvals/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify({ decision }) });
-    toast(decision === "allow" ? "Allowed. The agent carries on." : "Denied. The agent was told no.");
+    toast(question ? "Skipped. The agent was told you did not answer."
+      : decision === "allow" ? "Allowed. The agent carries on." : "Denied. The agent was told no.");
   } catch (err) {
     toast(err.status === 409 ? "Already answered in the session." : `Could not send the answer: ${err.message}`);
   }

@@ -15,7 +15,7 @@ DENY = "deny"
 
 
 class Pending:
-    def __init__(self, source_id, session_id, tool, text, description, complete):
+    def __init__(self, source_id, session_id, tool, text, description, complete, questions=None, tool_input=None):
         self.id = secrets.token_urlsafe(12)
         self.source_id = source_id
         self.session_id = session_id
@@ -23,6 +23,9 @@ class Pending:
         self.text = text
         self.description = description
         self.complete = complete
+        # AskUserQuestion: the questions as the board shows them, and the input to answer them with.
+        self.questions = questions
+        self.tool_input = tool_input
         self.created = time.time()
         self.future = asyncio.get_running_loop().create_future()
 
@@ -35,6 +38,7 @@ class Pending:
             "input": self.text,
             "description": self.description,
             "complete": self.complete,
+            "questions": self.questions,
             "created": self.created,
         }
 
@@ -43,10 +47,10 @@ class Approvals:
     def __init__(self):
         self._by_id = {}
 
-    def open(self, source_id, session_id, tool, text, description, complete):
+    def open(self, source_id, session_id, tool, text, description, complete, questions=None, tool_input=None):
         # A new request supersedes any older one still open for the same session.
         self.withdraw_session(source_id, session_id)
-        p = Pending(source_id, session_id, tool, text, description, complete)
+        p = Pending(source_id, session_id, tool, text, description, complete, questions, tool_input)
         self._by_id[p.id] = p
         return p
 
@@ -86,7 +90,11 @@ class Approvals:
 
 
 def hook_reply(decision):
-    """The PermissionRequest hook output for a decision (None: let the session decide)."""
+    """The PermissionRequest hook output for a decision (None: let the session decide).
+
+    A dict is a full decision, e.g. allow with `updatedInput` carrying the answers to questions."""
+    if isinstance(decision, dict):
+        return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}
     if decision == ALLOW:
         return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}
     if decision == DENY:

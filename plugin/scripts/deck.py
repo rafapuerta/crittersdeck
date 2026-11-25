@@ -423,6 +423,9 @@ def serve(url):
 
 
 if __name__ == "__main__":
+    # Windows reads pipes in the local code page (cp1252), which turns Claude Code's UTF-8 into mojibake.
+    for stream in (sys.stdin, sys.stdout):
+        stream.reconfigure(encoding="utf-8")
     mode, url = (sys.argv[1:3] + ["", ""])[:2]
     if not url.startswith(("http://", "https://")):
         sys.exit(0)

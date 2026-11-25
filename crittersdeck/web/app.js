@@ -956,7 +956,7 @@ function loadRoom(id, arrived) {
           `Delivered to ${m.delivered} of ${m.recipients}`) : null;
       return el("li", { class: m.from_board ? "mine" : "theirs", style: src ? { "--c": src.color } : null },
         el("span", { class: "chat-avatar", "aria-hidden": "true" },
-          critter("idle", m.from_board ? "#ece8e0" : src?.color ?? "#888888", "", m.from_board ? "" : s?.folder ?? "", false)),
+          critter("awake", m.from_board ? "#ece8e0" : src?.color ?? "#888888", "", m.from_board ? "" : s?.folder ?? "", false)),
         el("div", { class: "chat-bubble" },
           el("p", { class: "msg-who" }, el("strong", {}, who), src ? el("span", { class: "chat-machine" }, src.name) : null,
             el("time", { datetime: new Date(m.created * 1000).toISOString(), title: new Date(m.created * 1000).toLocaleString() },
@@ -1014,6 +1014,37 @@ $("#room-rename-form").addEventListener("submit", async (e) => {
   } catch (err) {
     toast(`Could not rename it: ${err.message}`);
   }
+});
+
+// The whole chat as a Markdown file: author, machine and time of each message, oldest first.
+$("#room-export").addEventListener("click", async () => {
+  const room = roomById(currentRoomId());
+  if (!room) return;
+  let rows = [];
+  try {
+    for (let before = ""; ; ) {
+      const page = await api(`/api/rooms/${room.id}/messages${before}`);
+      rows = [...page, ...rows];
+      if (page.length < 50) break;
+      before = `?before=${page[0].id}`;
+    }
+  } catch (err) {
+    toast(`Could not export it: ${err.message}`);
+    return;
+  }
+  const lines = [`# ${room.name}`, "", `Exported ${new Date().toLocaleString()} · ${rows.length} messages`, ""];
+  for (const m of rows) {
+    const [srcId, sid] = (m.from_id || ":").split(":");
+    const s = board.sessions.find((x) => x.source_id === srcId && x.session_id === sid);
+    const machine = board.sources.find((x) => x.id === srcId)?.name;
+    const who = m.from_board ? "You (board)" : s ? nameOf(s) : m.from;
+    lines.push(`## ${who}${machine ? ` · ${machine}` : ""} · ${new Date(m.created * 1000).toLocaleString()}`, "", m.text, "");
+    if (m.ref) lines.push(`Ref: ${m.ref}`, "");
+  }
+  const link = el("a", { href: URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/markdown" })),
+    download: `${room.name.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/g, "") || "room"}.md` });
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 });
 
 $("#room-close").addEventListener("click", async () => {

@@ -234,6 +234,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # Windows reads pipes in the local code page (cp1252), which turns Claude Code's UTF-8 into mojibake.
+    for stream in (sys.stdin, sys.stdout):
+        stream.reconfigure(encoding="utf-8")
     try:
         main(sys.argv)
     except Exception:  # never disturb the session

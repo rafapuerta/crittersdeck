@@ -1,7 +1,7 @@
 {
   "name": "crittersdeck",
-  "version": "0.2.0",
-  "description": "Report this machine's Claude Code sessions to a crittersdeck board, answer permission prompts and questions from the board, and (optionally) send each session's title and usage.",
+  "version": "0.3.0",
+  "description": "Report this machine's Claude Code sessions to a crittersdeck board, answer permission prompts and questions from the board, send each session's title and usage, and let sessions on different machines message each other.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/rafapuerta/crittersdeck",
   "userConfig": {
@@ -24,6 +24,28 @@
       "description": "Send Claude's title for each session and its usage (context, tokens, cost, model; never prompt text). Reads this machine's Claude sign-in for sessions linked to claude.ai, and needs python3. Turn it off to send only session events.",
       "required": false,
       "default": true
+    },
+    "agent_messages": {
+      "type": "boolean",
+      "title": "Messages between agents",
+      "description": "Let this machine's sessions send and receive messages through the board (deck_peers, deck_send, deck_inbox). Waiting messages are added to the next prompt, and a session that finishes with messages waiting carries on to read them. Turn it off to keep this machine out of it.",
+      "required": false,
+      "default": true
+    }
+  },
+  "mcpServers": {
+    "crittersdeck": {
+      "command": "python3",
+      "args": [
+        "-I",
+        "${CLAUDE_PLUGIN_ROOT}/scripts/deck.py",
+        "mcp",
+        "${user_config.ingest_url}"
+      ],
+      "env": {
+        "DECK_TOKEN": "${user_config.token}",
+        "DECK_ON": "${user_config.agent_messages}"
+      }
     }
   }
 }

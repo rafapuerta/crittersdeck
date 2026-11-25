@@ -35,8 +35,9 @@ PREAMBLE = (
 OFF = ("false", "0", "no", "off")
 WAIT_POLL = 50        # long-poll asked of the board, seconds
 WAIT_RETRY = 15       # between calls when the board answers at once (no long-poll) or cannot be reached
-WAIT_FOR = 6 * 3600   # `wait` gives up after this
-ALIVE_FOR = 120       # a PID file touched this recently belongs to a running `wait`
+WAIT_FOR = 110 * 60   # `wait` ends by itself before Claude Code kills background Bash (2 h at most)
+BASH_TIMEOUT = 7200000  # ms: the longest background Bash timeout Claude Code allows (its default is 30 min)
+ALIVE_FOR = 120       # a PID file touched this recently (and, on POSIX, whose process exists) is a running `wait`
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
@@ -118,13 +119,37 @@ def _file(data, kind, session_id):
     return os.path.join(data, f"{kind}-{session_id}")
 
 
+def _pid_in(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            pid = f.read().strip()
+        return int(pid) if pid.isascii() and pid.isdigit() and 0 < int(pid) < 2 ** 31 else None
+    except (OSError, ValueError):  # ValueError: not UTF-8
+        return None
+
+
 def wait_alive(data, session_id):
-    # A heartbeat (the file's mtime) rather than a PID probe: portable, and immune to PID reuse.
+    """A fresh heartbeat (the PID file's mtime) bounds PID reuse to ALIVE_FOR; on POSIX the process must also
+    exist, so a `wait` killed with SIGKILL (its file left behind) is seen as gone at once. On Windows os.kill
+    would terminate the process: the heartbeat alone decides there."""
     path = _file(data, "wait", session_id)
     try:
-        return bool(path) and time.time() - os.path.getmtime(path + ".pid") < ALIVE_FOR
+        if not path or time.time() - os.path.getmtime(path + ".pid") >= ALIVE_FOR:
+            return False
     except OSError:
         return False
+    pid = _pid_in(path + ".pid")
+    if pid is None:
+        return False  # a corrupt file is no wait, on every platform
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # exists, owned by someone else (EPERM)
+    return True
 
 
 def _remove(path):
@@ -185,7 +210,7 @@ def hook(url, data=""):
                 pass  # asked once: until `wait` starts or the next prompt, stops are let through
             print(json.dumps({"decision": "block", "reason": (
                 "No crittersdeck messages are waiting. So that new ones can wake this session while it is idle, "
-                "start this command with the Bash tool in the background (run_in_background: true), "
+                f"start this command with the Bash tool in the background (run_in_background: true, timeout: {BASH_TIMEOUT}), "
                 f"then end your turn without waiting for it:\n{wait_command(url, data)}\n"
                 "When it finishes, read the messages with deck_inbox.")}))
         return
@@ -302,11 +327,7 @@ def wait(url, data=""):
     if not token:
         print("crittersdeck wait: no token yet (the plugin's Stop hook saves it); nothing to wait for.")
         return 1
-    if wait_alive(data, session_id):
-        print("crittersdeck wait: already waiting for this session in another process.")
-        return 0
-    with open(pid_file, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+    mine = os.getpid()
 
     def give_up(why):
         # The end of this task wakes the session: without this marker the Stop hook would ask again, and loop.
@@ -314,15 +335,30 @@ def wait(url, data=""):
             pass
         print(f"crittersdeck wait: {why}; stopped, and it will not be asked for again in this session.")
         return 1
-    deadline = time.monotonic() + float(os.environ.get("DECK_WAIT_FOR", WAIT_FOR))
+    wait_for = float(os.environ.get("DECK_WAIT_FOR", WAIT_FOR))
+    deadline = time.monotonic() + wait_for
     retry = float(os.environ.get("DECK_WAIT_RETRY", WAIT_RETRY))
+    floor = 0  # messages that do not count (see below); None: just took over, the next answer sets it
     try:
         while time.monotonic() < deadline:
+            if _pid_in(pid_file) != mine:
+                if wait_alive(data, session_id):
+                    # Another `wait` serves this session: exiting would wake it for nothing, so stand by quietly
+                    # and take over when it is gone (killed, or ended because messages came).
+                    floor = None
+                    time.sleep(max(0.0, min(retry, deadline - time.monotonic())))
+                    continue
+                with open(pid_file + f".{mine}", "w", encoding="utf-8") as f:
+                    f.write(str(mine))
+                os.replace(pid_file + f".{mine}", pid_file)  # never seen half-written
+                continue  # re-read: of two waits taking over at once, the last to write owns it
             os.utime(pid_file)  # heartbeat: the Stop hook sees a live wait
             started = time.monotonic()
             left = deadline - started
-            status, body = call(url, token, session_id, "DeckWait", timeout=min(WAIT_POLL, left) + 10,
-                                wait=int(min(WAIT_POLL, left)))
+            # The board holds a request only while nothing waits: the baseline, and the count while it is above 0,
+            # are asked without holding so that the drop to 0 (the session read them) is seen.
+            poll = int(min(WAIT_POLL, left)) if floor == 0 else 0
+            status, body = call(url, token, session_id, "DeckWait", timeout=min(WAIT_POLL, left) + 10, wait=poll)
             if status in (401, 409):  # unknown token, or a session the board no longer knows
                 return give_up(failure(status, body))
             if status == 200 and "waiting" not in body:
@@ -330,15 +366,33 @@ def wait(url, data=""):
             if status == 200:
                 _remove(_file(data, "asked", session_id))  # running: a later stop, after it ends, may ask again
             n = body.get("waiting") if status == 200 else 0
-            if isinstance(n, int) and n > 0:
-                print(f"{n} new crittersdeck message{'s' if n != 1 else ''}; read them with deck_inbox.")
-                return 0
+            if status == 200 and isinstance(n, int):
+                # Taken over: messages already waiting most likely ended the other `wait`, whose end woke the
+                # session to read them (its next stop does); the same count again is not news, or the session would
+                # be woken twice. Any other count wakes it.
+                # shortcut: a read plus as many new messages within one `retry` look unchanged; they then wake it at
+                # this wait's deadline. Polls every `retry` s until the count changes.
+                # shortcut: a room message still inside the board's wake cooldown counts 0 here, so a takeover in that
+                # window can wake the session for it a second time once the cooldown ends (only if it is still unread).
+                if floor is None or n == 0:
+                    floor = n
+                elif n != floor:
+                    if _pid_in(pid_file) != mine:
+                        continue  # lost the file to a wait that started at the same moment: it wakes the session
+                    print(f"{n} new crittersdeck message{'s' if n != 1 else ''}; read them with deck_inbox.")
+                    return 0
             # shortcut: a board that answers at once (no long-poll) or is down is polled every `retry` s
             time.sleep(max(0.0, min(retry - (time.monotonic() - started), deadline - time.monotonic())))
-        print("No crittersdeck messages after 6 hours; stopped waiting.")
+        if _pid_in(pid_file) != mine and wait_alive(data, session_id):
+            # shortcut: a standby still wakes the session at its own deadline (Claude Code would kill it anyway)
+            print("crittersdeck wait: another wait still serves this session; this one stopped. Nothing to do.")
+            return 0
+        print(f"No crittersdeck messages for {wait_for / 60:g} minutes; stopped before Claude Code's limit for "
+              "background tasks. Start the same command again in the background when the Stop hook asks.")
         return 0
     finally:
-        _remove(pid_file)
+        if _pid_in(pid_file) == mine:
+            _remove(pid_file)
 
 
 def serve(url):

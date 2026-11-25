@@ -33,6 +33,22 @@ LIMITS = (10**13, 10**7)  # what the board accepts: counts, cost (anything else 
 _BRIDGE_ID = re.compile(r"session_[A-Za-z0-9]{1,64}")
 
 
+def _version():
+    """The plugin's version, from its plugin.json, for the User-Agent."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json"),
+                  encoding="utf-8") as f:
+            version = json.load(f).get("version")
+        return version if isinstance(version, str) and version else "unknown"
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+
+
+VERSION = _version()
+# Cloudflare in front of a board rejects urllib's default User-Agent (error 1010): name the plugin instead.
+USER_AGENT = f"crittersdeck-plugin/{VERSION}"
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None  # urllib would forward the Authorization header to wherever a redirect points
@@ -75,6 +91,7 @@ def from_claude_ai(bid):
         "Authorization": "Bearer " + token,
         "anthropic-version": "2023-06-01",
         "anthropic-beta": "ccr-byoc-2025-07-29",
+        "User-Agent": USER_AGENT,
     })
     try:
         with _open(request, timeout=TIMEOUT) as response:
@@ -165,6 +182,7 @@ def send(ingest_url, token, session_id, title, figures):
     request = urllib.request.Request(ingest_url.rstrip("/") + "/ingest", data=body, method="POST", headers={
         "Content-Type": "application/json",
         "Authorization": "Bearer " + token,
+        "User-Agent": USER_AGENT,
     })
     try:
         _open(request, timeout=TIMEOUT).close()

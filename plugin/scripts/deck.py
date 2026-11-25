@@ -26,6 +26,22 @@ PREAMBLE = (
 OFF = ("false", "0", "no", "off")
 
 
+def _version():
+    """The plugin's version, from its plugin.json, for the User-Agent."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json"),
+                  encoding="utf-8") as f:
+            version = json.load(f).get("version")
+        return version if isinstance(version, str) and version else "unknown"
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+
+
+VERSION = _version()
+# Cloudflare in front of a board rejects urllib's default User-Agent (error 1010): name the plugin instead.
+USER_AGENT = f"crittersdeck-plugin/{VERSION}"
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None  # urllib would forward the Authorization header to wherever a redirect points
@@ -38,7 +54,7 @@ def call(url, token, session_id, name, **fields):
     """One request to the board; (status, JSON body) or (0, {}) when it cannot be reached."""
     body = json.dumps({"hook_event_name": name, "session_id": session_id, **fields}).encode()
     request = urllib.request.Request(url.rstrip("/") + "/ingest", data=body, method="POST", headers={
-        "Content-Type": "application/json", "Authorization": "Bearer " + token})
+        "Content-Type": "application/json", "Authorization": "Bearer " + token, "User-Agent": USER_AGENT})
     try:
         with _open(request, timeout=TIMEOUT) as response:
             return response.status, json.load(response)
@@ -49,6 +65,16 @@ def call(url, token, session_id, name, **fields):
             return e.code, {}
     except (OSError, ValueError):
         return 0, {}
+
+
+def failure(status, body):
+    """What went wrong with a call, in a few words (the board's own error when it gives one)."""
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, str) and error:
+        return error
+    if not status:
+        return "The board cannot be reached (network error)."
+    return f"The board answered HTTP {status}."
 
 
 def render(messages):
@@ -115,7 +141,7 @@ def tool(url, token, session_id, name, args):
     if name == "deck_peers":
         status, body = call(url, token, session_id, "DeckPeers")
         if status != 200:
-            return body.get("error") or "The board cannot be reached.", True
+            return failure(status, body), True
         rows = [f"- {p['id']} · {p['machine']} · {p['title']} · {p['folder'] or '-'} · {p['status']}{' (this session)' if p['you'] else ''}"
                 for p in body["peers"]]
         return "Sessions (id · machine · title · folder · status):\n" + "\n".join(rows) + \
@@ -123,11 +149,11 @@ def tool(url, token, session_id, name, args):
     if name == "deck_send":
         fields = {"to": args.get("to"), "text": args.get("text"), "ref": args.get("ref") or ""}
         status, body = call(url, token, session_id, "DeckSend", **fields)
-        return ("Sent." if status == 200 else body.get("error") or "The board cannot be reached."), status != 200
+        return ("Sent." if status == 200 else failure(status, body)), status != 200
     if name == "deck_inbox":
         status, body = call(url, token, session_id, "DeckInbox")
         if status != 200:
-            return body.get("error") or "The board cannot be reached.", True
+            return failure(status, body), True
         return (render(body["messages"]) if body["messages"] else "No new messages."), False
     return f"Unknown tool {name}", True
 
@@ -158,7 +184,7 @@ def serve(url):
             continue  # a notification: nothing to answer
         if method == "initialize":
             result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
-                      "capabilities": {"tools": {}}, "serverInfo": {"name": "crittersdeck", "version": "0.3.1"}}
+                      "capabilities": {"tools": {}}, "serverInfo": {"name": "crittersdeck", "version": VERSION}}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":

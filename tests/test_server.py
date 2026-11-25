@@ -423,7 +423,7 @@ def test_plugin_hooks_cover_every_event():
     hooks = json.loads((root / "plugin/hooks/hooks.json").read_text())["hooks"]
     assert set(hooks) == set(EVENTS)
     for event, groups in hooks.items():
-        [h] = groups[0]["hooks"]
+        h = groups[0]["hooks"][0]  # the event itself; titles and messages are python steps after it
         assert h["type"] == "command" and h["command"] == "curl"
         args = h["args"]
         assert "${user_config.ingest_url}/ingest" in args
@@ -439,16 +439,15 @@ def test_plugin_hooks_cover_every_event():
     market = json.loads((root / ".claude-plugin/marketplace.json").read_text())
     assert market["name"] == "crittersdeck"
     assert [(p["name"], p["source"]) for p in market["plugins"]] == [
-        ("crittersdeck", "./plugin"), ("crittersdeck-titles", "./plugin-titles")]
-    # The title step is its own plugin, so only those who install it run python3 or share their Claude sign-in.
-    titles = json.loads((root / "plugin-titles/hooks/hooks.json").read_text())["hooks"]
-    assert set(titles) == {"UserPromptSubmit", "Stop"}
-    for groups in titles.values():
-        [t] = groups[0]["hooks"]
-        assert t["command"] == "python3" and t["async"] is True  # never delays the session
+        ("crittersdeck", "./plugin")]
+    # Titles and usage (async, never delays the session) and message delivery follow the event on these two.
+    for event in ("UserPromptSubmit", "Stop"):
+        _, t, d = hooks[event][0]["hooks"]
+        assert t["command"] == "python3" and t["async"] is True
         assert t["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/titles.py", "${user_config.ingest_url}"]
-    manifest = json.loads((root / "plugin-titles/.claude-plugin/plugin.json").read_text())
-    assert manifest["userConfig"]["token"]["sensitive"] is True
+        assert d["command"] == "python3" and "async" not in d  # its output is the hook's output
+        assert d["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/deck.py", "hook", "${user_config.ingest_url}"]
+    assert all(len(groups[0]["hooks"]) == 1 for e, groups in hooks.items() if e not in ("UserPromptSubmit", "Stop"))
 
 
 async def test_trailing_slash_base_url_still_reaches_ingest(client):

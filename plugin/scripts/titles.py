@@ -5,7 +5,8 @@ on stdin and prints nothing, so it can never add text to the session.
 
 Where it comes from:
 - The session's transcript (on this machine): the model, tokens in and out, cache, context used,
-  the number of prompts, and for terminal sessions the `ai-title` Claude Code writes there.
+  the number of prompts, the name given with /rename or by the desktop app (custom-title), and for
+  terminal sessions the `ai-title` Claude Code writes there.
 - Sessions linked to claude.ai (desktop app, web, Remote Control): Claude Code's session
   registry (<config>/sessions/<pid>.json) maps this session to its claude.ai id, and the
   claude.ai sessions API gives its title, context limit and cost. That API is not documented:
@@ -117,12 +118,12 @@ def from_claude_ai(bid):
 
 
 def from_transcript(path):
-    """(ai-title, figures) from a session's transcript: usage of each reply counted once.
+    """(ai-title, custom title, figures) from a session's transcript: usage of each reply counted once.
 
     shortcut: reads the whole transcript on each run (async, so it never delays the session);
     keep a byte offset if long transcripts make it costly.
     """
-    title, seen, last = None, set(), None
+    title, custom, seen, last = None, None, set(), None
     totals = {"tokens_in": 0, "tokens_out": 0, "cache_read": 0, "cache_write": 0, "turns": 0}
     model = None
     try:
@@ -137,6 +138,8 @@ def from_transcript(path):
                 kind = entry.get("type")
                 if kind == "ai-title" and isinstance(entry.get("aiTitle"), str):
                     title = entry["aiTitle"]
+                elif kind == "custom-title" and isinstance(entry.get("customTitle"), str):
+                    custom = entry["customTitle"]  # /rename, and the desktop app's titles
                 elif kind == "user" and not entry.get("isMeta") and is_prompt(entry.get("message")):
                     totals["turns"] += 1
                 elif kind == "assistant":
@@ -155,13 +158,23 @@ def from_transcript(path):
                     last = num("input_tokens") + num("cache_read_input_tokens") + num("cache_creation_input_tokens")
                     model = message.get("model") if isinstance(message.get("model"), str) else model
     except (OSError, TypeError):
-        return None, {}
+        return None, None, {}
     figures = dict(totals)
     if last is not None:
         figures["context_used"] = last  # what the latest request sent: the context in use
     if model:
         figures["model"] = model
-    return title, figures
+    return title, custom, figures
+
+
+def custom_title(transcript_path, fallback):
+    """The name given to the session: <transcript>/custom-title.json (desktop app), else the transcript's."""
+    if isinstance(transcript_path, str) and transcript_path.endswith(".jsonl"):
+        saved = (read_json(os.path.join(transcript_path[:-6], "custom-title.json")) or {})
+        name = saved.get("customTitle") if isinstance(saved, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name
+    return fallback
 
 
 def is_prompt(message):
@@ -204,12 +217,14 @@ def main(argv):
     if not isinstance(session_id, str) or not session_id:
         return
 
-    title, figures = from_transcript(event.get("transcript_path"))
+    title, custom, figures = from_transcript(event.get("transcript_path"))
+    custom = custom_title(event.get("transcript_path"), custom)
     bid = bridge_id(session_id)
     if bid:  # linked to claude.ai: its title, context limit and cost
         linked_title, extra = from_claude_ai(bid)
         title = linked_title or title  # claude.ai unreachable: keep what the transcript had
         figures.update(extra)
+    title = custom or title  # a name the person gave wins over generated ones
     title = " ".join(title.split()) if title else ""
     if not title and not figures:
         return

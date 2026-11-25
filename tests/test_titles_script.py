@@ -197,3 +197,17 @@ def test_redirects_are_not_followed(tmp_path):
     finally:
         server.shutdown()
     assert seen == []
+
+
+def test_a_name_given_to_the_session_wins(tmp_path, board):
+    url, received = board
+    path = transcript(tmp_path, "Generated")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "custom-title", "customTitle": "Renamed"}) + "\n")
+    run(tmp_path, url, {"session_id": "abc", "transcript_path": path})
+    # the desktop app keeps its titles beside the transcript, in <transcript>/custom-title.json
+    sidecar = Path(path[:-len(".jsonl")])
+    sidecar.mkdir()
+    (sidecar / "custom-title.json").write_text(json.dumps({"customTitle": "Dimensionamiento GPU"}), encoding="utf-8")
+    run(tmp_path, url, {"session_id": "abc", "transcript_path": path})
+    assert [r[2]["title"] for r in received] == ["Renamed", "Dimensionamiento GPU"]

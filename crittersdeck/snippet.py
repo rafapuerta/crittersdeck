@@ -11,8 +11,9 @@ EVENTS = (
     "SessionEnd",
 )
 
-# Sent by the crittersdeck-titles plugin, not by a Claude Code hook.
-TITLE_EVENT = "TitleUpdate"
+# Sent by the crittersdeck plugin (its send_usage step), not by Claude Code hooks: the session's title and usage.
+INFO_EVENT = "SessionInfo"
+TITLE_EVENT = "TitleUpdate"  # older plugin versions: the title only
 
 # A permission request stays open until someone answers, in the session or on the board.
 PERMISSION_TIMEOUT = 86400

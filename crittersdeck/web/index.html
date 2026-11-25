@@ -3,109 +3,316 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#121210">
   <title>crittersdeck</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/roboto-mono-latin-500-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/instrument-serif-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="styles.css">
   <script type="module" src="app.js"></script>
 </head>
 <body>
-  <header class="top">
-    <h1 class="brand"><img class="brand-mark" src="favicon.svg" alt="">crittersdeck</h1>
-    <p id="link-state" class="link-state" role="status" hidden></p>
-    <nav class="top-actions" id="top-actions" hidden aria-label="Board">
-      <button type="button" id="motion-toggle" class="btn ghost">Pause motion</button>
-      <button type="button" id="open-sources" class="btn ghost">Sources</button>
-      <button type="button" id="sign-out" class="btn ghost">Sign out</button>
-    </nav>
-  </header>
+  <a class="skip" href="#main">Skip to the page</a>
 
-  <main id="main">
-    <section id="login-view" class="login" hidden aria-labelledby="login-title">
-      <h2 id="login-title">Sign in</h2>
-      <form id="login-form" class="stack">
-        <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required aria-describedby="login-error">
-        <p id="login-error" class="error" role="alert"></p>
-        <button type="submit" class="btn primary">Sign in</button>
-      </form>
-    </section>
-
-    <div id="board-view" hidden>
-      <section class="needs" aria-labelledby="needs-title">
-        <h2 id="needs-title" class="section-title" tabindex="-1">Needs you <span id="needs-count" class="count">0</span></h2>
-        <p id="needs-empty" class="quiet">Nothing needs you. When an agent asks for permission or a question, it shows up here.</p>
-        <ul id="needs-list" class="needs-list" role="list"></ul>
-      </section>
-
-      <section class="deck" aria-labelledby="deck-title">
-        <h2 id="deck-title" class="visually-hidden">Sessions</h2>
-        <div id="deck-empty" class="empty" hidden>
-          <h3>No critters yet</h3>
-          <p>Add a source for each Claude account or machine, paste its hooks into that machine's Claude Code <code>settings.json</code>, and its sessions appear here.</p>
-          <button type="button" id="empty-add" class="btn primary">Add a source</button>
-        </div>
-        <div id="groups"></div>
-      </section>
-    </div>
+  <!-- sign-in: the only thing shown until the board knows who you are -->
+  <main id="login-view" class="login" hidden aria-labelledby="login-title">
+    <img class="login-mark" src="favicon.svg" alt="">
+    <p class="eyebrow">crittersdeck</p>
+    <h1 id="login-title" class="display">Sign <em>in.</em></h1>
+    <form id="login-form" class="login-form">
+      <label class="label" for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required aria-describedby="login-error">
+      <p id="login-error" class="error" role="alert"></p>
+      <button type="submit" class="btn primary">Sign in</button>
+    </form>
   </main>
+
+  <div id="app" class="app" hidden>
+    <aside class="side" aria-label="crittersdeck">
+      <a class="brand" href="#/"><img class="brand-mark" src="favicon.svg" alt=""><span>crittersdeck</span></a>
+      <nav class="nav" aria-label="Pages">
+        <p class="nav-group" aria-hidden="true">Deck</p>
+        <a href="#/" data-page="board"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2zM9 9h5v5H9z"/></svg>Board<span class="nav-count" id="nav-needs" hidden></span></a>
+        <a href="#/rooms" data-page="rooms"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 3h12v8H7l-3 3v-3H2z"/></svg>Rooms<span class="nav-count quiet-count" id="nav-rooms" hidden></span></a>
+        <a href="#/sources" data-page="sources"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 3h12v7H2zM6 13h4M8 10v3"/></svg>Sources</a>
+        <p class="nav-group" aria-hidden="true">App</p>
+        <a href="#/settings" data-page="settings"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/><path d="M5 2.5v3M11 6.5v3M7 10.5v3"/></svg>Settings</a>
+        <a href="#/about" data-page="about"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 7v4M8 5v.5"/></svg>About</a>
+      </nav>
+    </aside>
+
+    <header class="strip" aria-label="Summary">
+      <p class="stat stat-ask"><b id="stat-needs">0</b> need you</p>
+      <p class="stat"><b id="stat-working">0</b> working</p>
+      <p class="stat"><b id="stat-done">0</b> done</p>
+      <p class="stat wide-only"><b id="stat-sources">0</b> sources</p>
+      <p class="term" role="status"><span class="pulse" aria-hidden="true"></span><span id="link-state" class="link ok">live</span></p>
+    </header>
+
+    <main id="main" class="main" tabindex="-1">
+      <!-- Board -->
+      <section id="page-board" class="page" data-page="board" aria-labelledby="board-title">
+        <header class="page-head board-head">
+          <p class="eyebrow">Board</p>
+          <h1 id="board-title" class="display">Nothing needs <em>you.</em></h1>
+        </header>
+        <section class="needs" aria-labelledby="needs-title">
+          <h2 id="needs-title" class="section" tabindex="-1">Needs you <span id="needs-count" class="count">0</span></h2>
+          <p id="needs-empty" class="quiet">Nothing needs you. When an agent asks for permission or a question, it shows up here.</p>
+          <ul id="needs-list" class="needs-list" role="list"></ul>
+        </section>
+        <div id="deck-empty" class="empty" hidden>
+          <p class="eyebrow">No critters yet</p>
+          <p class="display">Add your first <em>machine.</em></p>
+          <p class="quiet">Each Claude account or computer is a source. Connect one and its sessions appear here as critters.</p>
+          <a class="btn primary" href="#/sources">Add a source</a>
+        </div>
+        <div class="board-body">
+          <section id="rooms-zone" class="rooms-zone" aria-labelledby="zone-title" hidden>
+            <h2 id="zone-title" class="section">Rooms <span id="zone-count" class="count">0</span></h2>
+            <p class="zone-hint"><span class="fine-only">Rooms belong to this board, for sessions on any machine. Drag a critter onto a room to add it.</span><span class="coarse-only">Rooms belong to this board, for sessions on any machine. To add one, open a critter and use Add to room.</span></p>
+            <ul id="room-tiles" class="room-grid" role="list"></ul>
+          </section>
+          <div id="groups" class="groups"></div>
+        </div>
+      </section>
+
+      <!-- Rooms -->
+      <section id="page-rooms" class="page" data-page="rooms" aria-labelledby="rooms-title" hidden>
+        <div id="rooms-index">
+          <header class="page-head">
+            <p class="eyebrow">Rooms</p>
+            <h1 id="rooms-title" class="display" tabindex="-1">Where agents <em>talk.</em></h1>
+          </header>
+          <p class="lede">A room is a chat between sessions, on any machine. Make one here, then drag critters onto it on the Board (or use Add to room in a session's panel). You can read it and write in it here.</p>
+          <ul id="rooms-list" class="rows" role="list"></ul>
+          <form id="room-form" class="rows form-row">
+            <div class="row">
+              <label class="field grow"><span class="label">New room</span><input id="room-name" maxlength="40" required placeholder="Room name" autocomplete="off"></label>
+              <button type="submit" class="btn primary">Create room</button>
+            </div>
+            <p id="room-error" class="error row-note" role="alert"></p>
+          </form>
+          <details id="rooms-closed" class="ended" hidden>
+            <summary id="rooms-closed-summary">Closed</summary>
+            <ul id="rooms-closed-list" class="rows" role="list"></ul>
+          </details>
+        </div>
+
+        <article id="room-view" class="room-view" aria-labelledby="room-title" hidden>
+          <header class="page-head">
+            <a class="back" href="#/">← Board</a>
+            <p class="eyebrow" id="room-eyebrow">Room</p>
+            <h1 id="room-title" class="display" tabindex="-1"></h1>
+          </header>
+          <p id="room-paused-note" class="note" hidden>Paused: waiting for you. The agents here woke each other several times in a row, so their posts no longer wake anyone; they still reach each member on its next turn. Write here to let them wake each other again.</p>
+          <p id="room-closed-note" class="note" hidden>This room is closed: it is read-only, and it will be deleted a week after it was closed.</p>
+          <div class="room-layout">
+            <section class="room-chat-pane" aria-labelledby="chat-title">
+              <h2 id="chat-title" class="section">Chat <span id="room-msg-count" class="count">0</span></h2>
+              <ol id="room-messages" class="chat" role="list"></ol>
+              <form id="room-post-form" class="chat-form">
+                <label class="visually-hidden" for="room-post-input">Write in this room</label>
+                <textarea id="room-post-input" maxlength="4000" rows="2" enterkeyhint="send" placeholder="Write to every member" aria-describedby="room-post-hint"></textarea>
+                <div class="chat-form-row">
+                  <span id="room-post-hint" class="hint"><span class="fine-only">Enter sends · Shift+Enter new line · </span>reaches every member, and wakes the idle ones</span>
+                  <button type="submit" class="btn primary">Send</button>
+                </div>
+              </form>
+            </section>
+            <aside class="room-side" aria-label="Room members and settings">
+              <h2 id="members-title" class="section">Members <span id="room-member-count" class="count">0</span></h2>
+              <ul id="room-members" class="members" role="list" aria-labelledby="members-title"></ul>
+              <form id="room-add-form" class="rename room-form">
+                <label class="label" for="room-add-select">Add a session</label>
+                <div class="rename-row">
+                  <select id="room-add-select"></select>
+                  <button type="submit" class="btn">Add</button>
+                </div>
+              </form>
+              <form id="room-rename-form" class="rename room-form">
+                <label class="label" for="room-rename-input">Name</label>
+                <div class="rename-row">
+                  <input id="room-rename-input" maxlength="40" required autocomplete="off">
+                  <button type="submit" class="btn">Save</button>
+                </div>
+              </form>
+              <button type="button" id="room-close" class="btn danger">Close room</button>
+            </aside>
+          </div>
+        </article>
+      </section>
+
+      <!-- Sources -->
+      <section id="page-sources" class="page" data-page="sources" aria-labelledby="sources-title" hidden>
+        <header class="page-head">
+          <p class="eyebrow">Sources</p>
+          <h1 id="sources-title" class="display" tabindex="-1">Who's out <em>there.</em></h1>
+        </header>
+        <h2 class="section">Connected <span class="section-note">one token and colour each</span></h2>
+        <ul id="sources-list" class="rows" role="list"></ul>
+
+        <h2 class="section">Add a source</h2>
+        <form id="source-form" class="rows form-row">
+          <div class="row">
+            <label class="field grow"><span class="label">Name</span><input name="name" maxlength="40" required placeholder="work laptop" autocomplete="off"></label>
+            <label class="field"><span class="label">Colour</span><input name="color" type="color" value="#4f8cff"></label>
+            <button type="submit" class="btn primary">Create</button>
+          </div>
+          <p id="source-error" class="error row-note" role="alert"></p>
+        </form>
+
+        <section id="source-created" class="created" hidden aria-labelledby="created-title">
+          <h2 id="created-title" class="section" tabindex="-1">Connect <span id="created-name"></span><span class="section-note">the token is shown only now</span></h2>
+          <div id="install-block" class="rows">
+            <div class="row column">
+              <p>On that machine, in a terminal (Windows: PowerShell), run:</p>
+              <pre id="install-snippet" class="term-block" tabindex="0" aria-label="Install commands"></pre>
+              <div class="actions"><button type="button" id="copy-install" class="btn">Copy commands</button></div>
+            </div>
+          </div>
+          <p class="note">That machine sends every session event to this board, tool input included (commands, file paths, sometimes file contents). The board keeps only a short summary. To leave the token out of your shell history, drop the <code>--config</code> parts: Claude Code then asks for the values.</p>
+          <p id="source-no-public-url" class="note warn" hidden>These commands use this board's own address, because <code>CRITTERSDECK_PUBLIC_URL</code> is not set. Machines elsewhere need the public ingest address instead.</p>
+          <p id="source-insecure" class="note warn" hidden><strong>This address is not HTTPS.</strong> Outside your own network, events and the token would travel in clear text.</p>
+          <details id="manual-block" class="manual">
+            <summary>Or set it up by hand in settings.json</summary>
+            <p>Merge this into <code>~/.claude/settings.json</code> (Windows: <code>%USERPROFILE%\.claude\settings.json</code>).</p>
+            <pre id="source-snippet" class="term-block" tabindex="0" aria-label="Hooks for settings.json"></pre>
+            <div class="actions"><button type="button" id="copy-snippet" class="btn">Copy</button></div>
+          </details>
+        </section>
+      </section>
+
+      <!-- Settings -->
+      <section id="page-settings" class="page" data-page="settings" aria-labelledby="settings-title" hidden>
+        <header class="page-head">
+          <p class="eyebrow">Settings</p>
+          <h1 id="settings-title" class="display">Make it <em>yours.</em></h1>
+        </header>
+        <h2 class="section">Notifications <span class="section-note">this browser only</span></h2>
+        <div class="rows">
+          <div class="row">
+            <span class="icon-box" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M4 11V7a4 4 0 0 1 8 0v4l1 1H3zM7 14h2"/></svg></span>
+            <div class="row-text"><p class="row-title" id="notify-label">Tell me</p><p class="row-sub" id="notify-sub">A desktop notification from the browser, even when this tab is in the background.</p></div>
+            <div class="segmented" role="radiogroup" aria-labelledby="notify-label">
+              <button type="button" role="radio" data-notify="never">Never</button>
+              <button type="button" role="radio" data-notify="needs">When one needs me</button>
+              <button type="button" role="radio" data-notify="done">Also when done</button>
+            </div>
+          </div>
+          <div class="row">
+            <span class="icon-box" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M3 6h3l4-3v10l-4-3H3z"/></svg></span>
+            <div class="row-text"><p class="row-title" id="sound-label">Sound</p><p class="row-sub">A short chime with each notification.</p></div>
+            <button type="button" class="switch" id="sound-switch" role="switch" aria-labelledby="sound-label"><span></span></button>
+          </div>
+          <div class="row">
+            <span class="icon-box" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2 8h3l2-5 2 10 2-5h3"/></svg></span>
+            <div class="row-text"><p class="row-title">Try it</p><p class="row-sub" id="notify-test-sub">Sends a sample notification.</p></div>
+            <button type="button" class="btn" id="notify-test">Send a test</button>
+          </div>
+        </div>
+
+        <h2 class="section">Display</h2>
+        <div class="rows">
+          <div class="row">
+            <span class="icon-box" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M5 4v8M11 4v8"/></svg></span>
+            <div class="row-text"><p class="row-title" id="motion-label">Moving critters</p><p class="row-sub">They bob while working and hop when they need you. Off when your system asks for less motion.</p></div>
+            <button type="button" class="switch" id="motion-switch" role="switch" aria-labelledby="motion-label"><span></span></button>
+          </div>
+          <div class="row">
+            <span class="icon-box" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4v4l3 2"/></svg></span>
+            <div class="row-text"><p class="row-title">Idle after</p><p class="row-sub">A working session that goes quiet reads as idle after a while. Set on the server (<code>CRITTERSDECK_IDLE_MINUTES</code>).</p></div>
+            <span class="value" id="idle-value">30 min</span>
+          </div>
+        </div>
+
+        <h2 class="section">Account</h2>
+        <div class="rows">
+          <div class="row">
+            <span class="icon-box" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 14c.5-3 2.5-4.5 5-4.5s4.5 1.5 5 4.5"/></svg></span>
+            <div class="row-text"><p class="row-title" id="account-title">Signed in</p><p class="row-sub">Whoever can open this board can answer for your agents.</p></div>
+            <button type="button" class="btn" id="sign-out">Sign out</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- About -->
+      <section id="page-about" class="page" data-page="about" aria-labelledby="about-title" hidden>
+        <header class="page-head">
+          <p class="eyebrow">About</p>
+          <h1 id="about-title" class="display">crittersdeck <em id="about-version">0.0.0</em></h1>
+        </header>
+        <p class="lede">A status board for your Claude Code sessions, across accounts and machines. Every session is a critter; when one needs you, you can answer it here.</p>
+        <h2 class="section">This board</h2>
+        <dl class="rows facts" id="about-facts"></dl>
+        <h2 class="section">Credits</h2>
+        <div class="rows">
+          <div class="row"><div class="row-text"><p class="row-title">Licence</p><p class="row-sub">Apache License 2.0.</p></div></div>
+          <div class="row"><div class="row-text"><p class="row-title">Fonts</p><p class="row-sub">Instrument Serif, Inter and Roboto Mono, under the SIL Open Font License 1.1 (<a href="fonts/LICENSE-instrument-serif.txt">Instrument Serif</a>, <a href="fonts/LICENSE-inter.txt">Inter</a>, <a href="fonts/LICENSE-roboto-mono.txt">Roboto Mono</a>).</p></div></div>
+        </div>
+      </section>
+    </main>
+  </div>
 
   <output id="toast" class="toast"></output>
 
-  <dialog id="detail-dialog" aria-labelledby="detail-title" closedby="any">
-    <h2 id="detail-title"></h2>
-    <dl id="detail-body" class="facts"></dl>
-    <form id="rename-form" class="row wrap">
-      <label class="grow">Title <input id="rename-input" maxlength="80" placeholder="Name this session"></label>
-      <button type="submit" class="btn">Save title</button>
-    </form>
-    <form method="dialog" class="row end wrap">
-      <button type="button" id="detail-forget" class="btn danger-ghost">Forget session</button>
-      <button type="button" id="detail-seen" class="btn">Mark as seen</button>
-      <button value="close" class="btn primary" autofocus>Close</button>
-    </form>
-  </dialog>
-
-  <dialog id="sources-dialog" aria-labelledby="sources-title" closedby="any">
-    <h2 id="sources-title">Sources</h2>
-    <p class="quiet">A source is one Claude account or machine. Each one has its own token and colour.</p>
-    <ul id="sources-list" class="sources-list" role="list"></ul>
-    <form id="source-form" class="stack">
-      <h3>Add a source</h3>
-      <div class="row wrap">
-        <label class="grow">Name <input name="name" maxlength="40" required placeholder="work laptop"></label>
-        <label>Colour <input name="color" type="color" value="#4f8cff"></label>
-      </div>
-      <p id="source-error" class="error" role="alert"></p>
-      <button type="submit" class="btn primary">Create</button>
-    </form>
-    <div id="source-created" class="created" hidden>
-      <h3 id="created-title" tabindex="-1">Connect that machine</h3>
-      <div id="install-block">
-        <p>Run these two commands in a terminal on that machine (Windows: PowerShell or cmd). The token is shown only now.</p>
-        <pre id="install-snippet" tabindex="0" aria-label="Install commands"></pre>
-        <button type="button" id="copy-install" class="btn">Copy commands</button>
-        <p class="small quiet">Rather not have the token in your shell history? Run the second command without the two <code>--config</code> parts and Claude Code asks for the values. To disconnect the machine later: <code>claude plugin uninstall crittersdeck@crittersdeck</code>.</p>
-      </div>
-      <p class="warn">That machine will send every session event to this board, including the tool input: commands, file paths and sometimes file contents. The board keeps only a short summary.</p>
-      <p id="source-no-public-url" class="warn" hidden>The URL below is this board's own address, because <code>CRITTERSDECK_PUBLIC_URL</code> is not set. Machines elsewhere need the public ingest address instead.</p>
-      <p id="source-insecure" class="warn" hidden><strong>This address is not HTTPS.</strong> Outside your own network, events (and the token) would travel in clear text. Set <code>CRITTERSDECK_PUBLIC_URL</code> to an https address.</p>
-      <details id="manual-block">
-        <summary>Or set it up by hand in settings.json</summary>
-        <p>Merge this into <code>~/.claude/settings.json</code> (Windows: <code>%USERPROFILE%\.claude\settings.json</code>).</p>
-        <pre id="source-snippet" tabindex="0" aria-label="Hooks for settings.json"></pre>
-        <button type="button" id="copy-snippet" class="btn">Copy</button>
-      </details>
+  <!-- side panel: one session -->
+  <dialog id="drawer" class="drawer" aria-labelledby="drawer-title" closedby="any">
+    <div class="drawer-head">
+      <span id="drawer-art" class="drawer-art"></span>
+      <p id="drawer-eyebrow" class="eyebrow"></p>
+      <form method="dialog"><button class="icon-btn" value="close" aria-label="Close" autofocus>✕</button></form>
     </div>
-    <form method="dialog" class="row end">
-      <button value="close" class="btn">Done</button>
-    </form>
+    <div class="drawer-title-row">
+      <h2 id="drawer-title" class="display"></h2>
+      <p id="drawer-badge" class="badge"></p>
+    </div>
+    <dl id="drawer-facts" class="drawer-facts"></dl>
+    <div id="drawer-ask" class="drawer-ask" hidden>
+      <p class="label">Waiting for you</p>
+      <p id="drawer-ask-text"></p>
+      <button type="button" class="btn ink" id="drawer-ask-go">Answer it</button>
+    </div>
+    <section class="drawer-messages" aria-labelledby="messages-title">
+      <h3 id="messages-title" class="label">Messages</h3>
+      <ol id="messages-list" class="messages" role="list"></ol>
+      <form id="message-form" class="rename">
+        <label class="visually-hidden" for="message-input">Write to this session</label>
+        <div class="rename-row">
+          <input id="message-input" maxlength="4000" placeholder="Write to this session" autocomplete="off">
+          <button type="submit" class="btn ink">Send</button>
+        </div>
+      </form>
+    </section>
+    <div class="drawer-foot">
+      <div id="drawer-usage"></div>
+      <form id="drawer-room-form" class="rename" hidden>
+        <label class="label" for="drawer-room-select">Add to room</label>
+        <div class="rename-row">
+          <select id="drawer-room-select"></select>
+          <button type="submit" class="btn ink">Add</button>
+        </div>
+      </form>
+      <form id="rename-form" class="rename">
+        <label class="label" for="rename-input">Name</label>
+        <div class="rename-row">
+          <input id="rename-input" maxlength="80" placeholder="Name this session" autocomplete="off">
+          <button type="submit" class="btn ink">Save</button>
+        </div>
+      </form>
+      <div class="drawer-actions">
+        <button type="button" id="drawer-seen" class="btn ink-outline">Mark as seen</button>
+        <button type="button" id="drawer-forget" class="btn ink-outline">Forget session</button>
+      </div>
+      <p class="drawer-hint" aria-hidden="true">Esc closes · ← → next session</p>
+    </div>
   </dialog>
 
-  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
-    <h2 id="confirm-title"></h2>
+  <dialog id="confirm-dialog" class="confirm" aria-labelledby="confirm-title">
+    <h2 id="confirm-title" class="display small"></h2>
     <p id="confirm-text"></p>
-    <form method="dialog" class="row end">
+    <form method="dialog" class="actions">
       <button value="cancel" class="btn" autofocus>Cancel</button>
       <button value="confirm" class="btn danger" id="confirm-ok">Delete</button>
     </form>

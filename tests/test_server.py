@@ -406,6 +406,8 @@ async def test_install_commands_when_a_marketplace_is_set(tmp_path):
         assert add == "claude plugin marketplace add https://git.example.com/me/crittersdeck"
         assert "--config ingest_url=https://ingest.example.com " in install
         assert install.endswith("--config token=" + created["token"])
+        me = (await c.get("/api/me")).json()
+        assert (me["version"], me["public_url"]) == ("0.2.0", "https://ingest.example.com")
 
 
 async def test_no_install_commands_without_marketplace(client):
@@ -423,7 +425,7 @@ def test_plugin_hooks_cover_every_event():
     hooks = json.loads((root / "plugin/hooks/hooks.json").read_text())["hooks"]
     assert set(hooks) == set(EVENTS)
     for event, groups in hooks.items():
-        h = groups[0]["hooks"][0]  # the event itself; titles and messages are python steps after it
+        h, *usage = groups[0]["hooks"]
         assert h["type"] == "command" and h["command"] == "curl"
         args = h["args"]
         assert "${user_config.ingest_url}/ingest" in args
@@ -432,22 +434,25 @@ def test_plugin_hooks_cover_every_event():
         # only the answer to a permission request may become hook output
         assert ("-o" in args) == (event != "PermissionRequest")
         assert "-fsS" in h["args"]
-        assert h["args"][h["args"].index("${user_config.ingest_url}/ingest") - 1] == "--url"  # HTTP errors fail quietly (non-blocking), nothing is printed as hook output
+        assert h["args"][h["args"].index("${user_config.ingest_url}/ingest") - 1] == "--url"
         assert h["timeout"] >= (3600 if event == "PermissionRequest" else 5)
+        # after each prompt and reply: titles and usage (in the background) and message delivery
+        assert len(usage) == (2 if event in ("UserPromptSubmit", "Stop") else 0)
+        if usage:
+            titles, deliver = usage
+            assert titles["command"] == "python3" and titles["async"] is True
+            assert titles["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/titles.py", "${user_config.ingest_url}"]
+            assert deliver["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/deck.py", "hook", "${user_config.ingest_url}",
+                                       "${CLAUDE_PLUGIN_DATA}"]
+            assert "async" not in deliver and deliver["timeout"] <= 10  # its output is the delivery
     manifest = json.loads((root / "plugin/.claude-plugin/plugin.json").read_text())
     assert manifest["userConfig"]["token"]["sensitive"] is True
+    assert manifest["userConfig"]["send_usage"]["type"] == "boolean"
+    mcp = manifest["mcpServers"]["crittersdeck"]
+    assert mcp["env"]["DECK_TOKEN"] == "${user_config.token}" and not any("token" in a for a in mcp["args"])
     market = json.loads((root / ".claude-plugin/marketplace.json").read_text())
     assert market["name"] == "crittersdeck"
-    assert [(p["name"], p["source"]) for p in market["plugins"]] == [
-        ("crittersdeck", "./plugin")]
-    # Titles and usage (async, never delays the session) and message delivery follow the event on these two.
-    for event in ("UserPromptSubmit", "Stop"):
-        _, t, d = hooks[event][0]["hooks"]
-        assert t["command"] == "python3" and t["async"] is True
-        assert t["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/titles.py", "${user_config.ingest_url}"]
-        assert d["command"] == "python3" and "async" not in d  # its output is the hook's output
-        assert d["args"] == ["-I", "${CLAUDE_PLUGIN_ROOT}/scripts/deck.py", "hook", "${user_config.ingest_url}"]
-    assert all(len(groups[0]["hooks"]) == 1 for e, groups in hooks.items() if e not in ("UserPromptSubmit", "Stop"))
+    assert [(p["name"], p["source"]) for p in market["plugins"]] == [("crittersdeck", "./plugin")]  # one plugin
 
 
 async def test_trailing_slash_base_url_still_reaches_ingest(client):
@@ -491,7 +496,7 @@ def test_old_database_gets_title_column(tmp_path):
     from crittersdeck.store import Store
 
     s = Store(str(db)).session("a", "s1")
-    assert (s["title"], s["renamed"]) == ("", 0)
+    assert (s["title"], s["renamed"], s["info"]) == ("", 0, "{}")
 
 
 async def test_title_from_claude(client):
@@ -584,3 +589,430 @@ async def test_questions_can_be_skipped_and_odd_shapes_stay_raw(client):
     twice = {"questions": [ASK["questions"][0], ASK["questions"][0]]}  # same text twice: answers would collide
     from crittersdeck.server import question_form
     assert question_form(twice) is None and question_form(ASK) is not None
+
+
+async def test_session_info_from_the_plugin(client):
+    await sign_in(client)
+    created = await new_source(client)
+    token, sid = created["token"], created["source"]["id"]
+    info = lambda **kw: {"hook_event_name": "SessionInfo", "session_id": "s1", **kw}
+    usage = {"model": "claude-opus-5-5", "context_used": 567797, "context_max": 1000000, "tokens_in": 806,
+             "tokens_out": 541165, "cache_read": 133163251, "cache_write": 4038422, "turns": 21, "cost_usd": 93.75200666}
+    assert (await send(client, token, info(title="T", info=usage))).json() == {"applied": False}  # unknown session
+    await send(client, token, event("UserPromptSubmit", prompt="first prompt"))
+    before = (await board(client))["sessions"][0]
+    assert (await send(client, token, info(title="Agentes", info=usage))).json() == {"applied": True}
+    s = (await board(client))["sessions"][0]
+    assert s["title"] == "Agentes" and s["info"] == {**usage, "cost_usd": 93.752}
+    assert (s["status"], s["updated"]) == (before["status"], before["updated"])  # not activity
+    # usage only, no title: the title stays
+    assert (await send(client, token, info(info={"turns": 22}))).status_code == 200
+    s = (await board(client))["sessions"][0]
+    assert s["title"] == "Agentes" and s["info"] == {**usage, "cost_usd": 93.752, "turns": 22}  # missing figures keep their last value
+    bad = [
+        info(), info(info={}), info(info="x"), info(info={"turns": -1}), info(info={"turns": 1.5}), info(info={"turns": True}),
+        info(info={"tokens_in": 10**13}), info(info={"cost_usd": "1"}), info(info={"model": ""}),
+        info(info={"prompt": "secret"}),  # nothing but the known figures is kept
+        info(title="   "), info(title=5, info={"turns": 1}),
+    ]
+    for body in bad:
+        assert (await send(client, token, body)).status_code == 400, body
+    await send(client, token, info(info={"model": "x‮y" + "m" * 200}))
+    assert (await board(client))["sessions"][0]["info"]["model"] == "x\\u{202e}y" + "m" * 70
+    # a title with empty usage keeps the stored usage
+    await send(client, token, info(title="Agentes", info={}))
+    assert (await board(client))["sessions"][0]["info"]["model"] == "x\\u{202e}y" + "m" * 70
+    # the older plugin's title-only event still works
+    assert (await send(client, token, {"hook_event_name": "TitleUpdate", "session_id": "s1", "title": "Old"})).json() == {"applied": True}
+    assert (await board(client))["sessions"][0]["title"] == "Old"
+
+
+async def test_messages_between_sessions(client):
+    await sign_in(client)
+    a = await new_source(client, "Seismenos")
+    b = await new_source(client, "Dubois")
+    call = lambda tok, sid, name, **kw: send(client, tok, {"hook_event_name": name, "session_id": sid, **kw})
+    # only sessions the board knows can use it
+    assert (await call(a["token"], "a1", "DeckPeers")).status_code == 409
+    for tok, sid in ((a["token"], "a1"), (a["token"], "a2"), (b["token"], "b1")):
+        await send(client, tok, event("UserPromptSubmit", sid=sid, prompt=f"work {sid}"))
+    # only machines with messaging on (they ask for their inbox) are listed or reachable
+    assert [p["id"].split(":")[1] for p in (await call(a["token"], "a1", "DeckPeers")).json()["peers"]] == ["a1", "a2"]
+    await call(b["token"], "b1", "DeckInbox")
+    peers = (await call(a["token"], "a1", "DeckPeers")).json()
+    assert {p["id"].split(":")[1] for p in peers["peers"]} == {"a1", "a2", "b1"}
+    assert [p["you"] for p in peers["peers"] if p["id"].endswith(":a1")] == [True]
+    assert peers["machines"] == ["Dubois", "Seismenos"]
+    b1 = next(p["id"] for p in peers["peers"] if p["id"].endswith(":b1"))
+    # to one session, to a machine, to all
+    assert (await call(a["token"], "a1", "DeckSend", to=b1, text="PR 73 ready for review", ref="https://git/pr/73")).status_code == 200
+    assert (await call(a["token"], "a1", "DeckSend", to="dubois", text="to every Dubois session")).status_code == 200
+    assert (await call(b["token"], "b1", "DeckSend", to="all", text="hello‮ everyone")).status_code == 200
+    bad = [dict(to="all", text=""), dict(to="all", text="x" * 4001), dict(to="nowhere", text="x"), dict(to="zz:nope", text="x"),
+           dict(to=None, text="x"), dict(to="all", text="x", ref="r" * 301), dict(to="all", text=5), dict(to="all", text="x", ref="a\nb")]
+    for kw in bad:
+        assert (await call(a["token"], "a1", "DeckSend", **kw)).status_code == 400, kw
+    # the board shows what waits for each session
+    unread = {s["session_id"]: s["unread"] for s in (await board(client))["sessions"]}
+    assert unread == {"a1": 1, "a2": 1, "b1": 2}  # nobody gets their own message
+    inbox = (await call(b["token"], "b1", "DeckInbox")).json()["messages"]
+    assert [m["text"] for m in inbox] == ["PR 73 ready for review", "to every Dubois session"]
+    assert inbox[0]["from"].startswith('session "work a1" on Seismenos') and inbox[0]["ref"] == "https://git/pr/73"
+    assert inbox[0]["from_id"] == f"{a['source']['id']}:a1" and inbox[0]["from_board"] is False
+    assert (await call(b["token"], "b1", "DeckInbox")).json()["messages"] == []  # delivered once
+    a2 = (await call(a["token"], "a2", "DeckInbox")).json()["messages"]
+    assert a2[0]["text"] == "hello\\u{202e} everyone"  # hidden characters shown, never passed on
+    # from the board to one session; the thread shows both directions
+    sid = a["source"]["id"]
+    assert (await client.post(f"/api/sessions/{sid}/a1/messages", json={"text": "Rafa: go ahead"})).status_code == 200
+    assert (await client.post(f"/api/sessions/{sid}/a1/messages", json={"text": "  "})).status_code == 400
+    thread = (await client.get(f"/api/sessions/{sid}/a1/messages")).json()
+    assert [(m["text"], m["outgoing"], m["delivered"]) for m in thread] == [
+        ("PR 73 ready for review", True, False), ("to every Dubois session", True, False),
+        ("hello\\u{202e} everyone", False, False), ("Rafa: go ahead", False, False)]
+    got = (await call(a["token"], "a1", "DeckInbox")).json()["messages"]
+    assert [m["from_board"] for m in got] == [False, True]
+
+
+async def test_message_limits(client, monkeypatch):
+    from crittersdeck import server
+
+    await sign_in(client)
+    a = await new_source(client, "A")
+    for sid in ("x", "y"):
+        await send(client, a["token"], event("UserPromptSubmit", sid=sid, prompt="p"))
+    call = lambda sid, name, **kw: send(client, a["token"], {"hook_event_name": name, "session_id": sid, **kw})
+    await call("y", "DeckInbox")
+    codes = [(await call("x", "DeckSend", to="A", text="m" * 3000)).status_code for _ in range(12)]
+    assert codes.count(200) == 10 and codes[-1] == 429  # 10 messages a minute per source
+    first = (await call("y", "DeckInbox")).json()["messages"]
+    assert len(first) == 2  # about 8 KB per delivery: the rest waits
+    assert len((await call("y", "DeckInbox")).json()["messages"]) == 2
+
+
+async def test_wait_counts_without_delivering_and_long_polls(client):
+    await sign_in(client)
+    a = await new_source(client, "A")
+    for sid in ("x", "y"):
+        await send(client, a["token"], event("UserPromptSubmit", sid=sid, prompt="p"))
+    call = lambda sid, name, **kw: send(client, a["token"], {"hook_event_name": name, "session_id": sid, **kw})
+    await call("y", "DeckInbox")
+    assert (await call("y", "DeckWait")).json() == {"waiting": 0}  # no wait: answers at once
+    # held until a message arrives, then answers with the count
+    held = asyncio.create_task(call("y", "DeckWait", wait=30))
+    await asyncio.sleep(0.1)
+    assert not held.done()
+    await call("x", "DeckSend", to=f"{a['source']['id']}:y", text="hi")
+    assert (await asyncio.wait_for(held, 5)).json() == {"waiting": 1}
+    assert (await call("y", "DeckWait", wait=30)).json() == {"waiting": 1}  # still there: not delivered
+    assert len((await call("y", "DeckInbox")).json()["messages"]) == 1
+    for odd in (-5, "10", True, None):  # bad values mean no wait
+        assert (await asyncio.wait_for(call("y", "DeckWait", wait=odd), 2)).json() == {"waiting": 0}
+    for raw in (b"NaN", b"-Infinity"):  # json.loads takes them; NaN would hold the request forever
+        body = b'{"hook_event_name": "DeckWait", "session_id": "y", "wait": ' + raw + b"}"
+        r = await asyncio.wait_for(client.post("/ingest", content=body, headers={"authorization": f"Bearer {a['token']}"}), 2)
+        assert r.json() == {"waiting": 0}
+
+
+async def test_wait_is_capped(client, monkeypatch):
+    from crittersdeck import server
+
+    monkeypatch.setattr(server, "WAIT_MAX", 0.2)
+    await sign_in(client)
+    a = await new_source(client, "A")
+    await send(client, a["token"], event("UserPromptSubmit", sid="y", prompt="p"))
+    r = await asyncio.wait_for(send(client, a["token"], {"hook_event_name": "DeckWait", "session_id": "y", "wait": 3600}), 3)
+    assert r.json() == {"waiting": 0}
+    monkeypatch.setattr(server, "WAIT_MAX", 30)
+    monkeypatch.setattr(server, "MAX_SESSIONS_PER_SOURCE", 1)
+    held = asyncio.create_task(send(client, a["token"], {"hook_event_name": "DeckWait", "session_id": "y", "wait": 30}))
+    await asyncio.sleep(0.1)
+    # one held per session is the most the plugin needs: past the per-source cap, answered at once
+    r = await asyncio.wait_for(send(client, a["token"], {"hook_event_name": "DeckWait", "session_id": "y", "wait": 30}), 2)
+    assert r.json() == {"waiting": 0} and not held.done()
+    held.cancel()
+
+
+# ---- rooms --------------------------------------------------------------------------
+
+async def room_setup(client):
+    await sign_in(client)
+    a = await new_source(client, "Seismenos")
+    b = await new_source(client, "Dubois")
+    for tok, sid in ((a["token"], "a1"), (a["token"], "a2"), (b["token"], "b1")):
+        await send(client, tok, event("UserPromptSubmit", sid=sid, prompt=f"work {sid}"))
+        await send(client, tok, {"hook_event_name": "DeckInbox", "session_id": sid})  # messaging on
+    ids = {"a1": f"{a['source']['id']}:a1", "a2": f"{a['source']['id']}:a2", "b1": f"{b['source']['id']}:b1"}
+    tok = {"a1": a["token"], "a2": a["token"], "b1": b["token"]}
+    call = lambda sid, name, **kw: send(client, tok[sid], {"hook_event_name": name, "session_id": sid, **kw})
+    return ids, call
+
+
+async def test_rooms_on_the_board(client):
+    ids, call = await room_setup(client)
+    r = await client.post("/api/rooms", json={"name": "Release 0.5", "members": [ids["a1"]]})
+    assert r.status_code == 200, r.text
+    room = r.json()["id"]
+    assert (await client.post("/api/rooms", json={"name": "release 0.5"})).status_code == 409  # names are unique
+    assert (await client.post("/api/rooms", json={"name": ""})).status_code == 400
+    assert (await client.post("/api/rooms", json={"name": "X", "members": ["zz:nope"]})).status_code == 404
+    assert [x["name"] for x in (await board(client))["rooms"]] == ["Release 0.5"]  # no half-made room
+    src, sid = ids["b1"].split(":")
+    assert (await client.put(f"/api/rooms/{room}/members/{src}/{sid}")).json() == {"added": True}
+    assert (await client.put(f"/api/rooms/{room}/members/{src}/{sid}")).json() == {"added": False}  # idempotent
+    assert (await client.put(f"/api/rooms/{room}/members/{src}/nope")).status_code == 404
+    # the welcome notice names the room and the other members, and no history
+    welcome = (await call("b1", "DeckInbox")).json()["messages"]
+    assert len(welcome) == 1 and "Release 0.5" in welcome[0]["text"] and 'session "work a1"' in welcome[0]["text"]
+    assert (await client.patch(f"/api/rooms/{room}", json={"name": "Release 0.6"})).status_code == 200
+    rooms = (await board(client))["rooms"]
+    assert rooms[0]["name"] == "Release 0.6" and len(rooms[0]["members"]) == 2
+    # the board posts; every member gets it, and the history says how many it reached
+    assert (await client.post(f"/api/rooms/{room}/messages", json={"text": "ship it?"})).status_code == 200
+    got = (await call("a1", "DeckInbox")).json()["messages"]
+    assert [m["text"] for m in got][-1] == "ship it?" and got[-1]["room_name"] == "Release 0.6" and got[-1]["from_board"]
+    history = (await client.get(f"/api/rooms/{room}/messages")).json()
+    assert [(m["text"], m["delivered"]) for m in history] == [("ship it?", 1)]
+    # direct threads do not show room messages
+    a_src, _ = ids["a1"].split(":")
+    assert all(m["to_kind"] != "room" for m in (await client.get(f"/api/sessions/{a_src}/a1/messages")).json())
+    # remove, close (archive: read-only, still listed)
+    assert (await client.delete(f"/api/rooms/{room}/members/{src}/{sid}")).status_code == 200
+    assert (await client.delete(f"/api/rooms/{room}/members/{src}/{sid}")).status_code == 404
+    assert (await client.delete(f"/api/rooms/{room}")).status_code == 200
+    assert (await board(client))["rooms"][0]["closed"] is not None
+    assert (await client.post(f"/api/rooms/{room}/messages", json={"text": "late"})).status_code == 409
+    assert (await client.put(f"/api/rooms/{room}/members/{src}/{sid}")).status_code == 409
+    assert (await client.post("/api/rooms", json={"name": "Release 0.6"})).status_code == 200  # closed frees the name
+
+
+async def test_rooms_need_sign_in_and_csrf(client):
+    ids, _ = await room_setup(client)
+    room = (await client.post("/api/rooms", json={"name": "R"})).json()["id"]
+    del client.headers["x-csrf-token"]
+    assert (await client.post(f"/api/rooms/{room}/messages", json={"text": "x"})).status_code == 403
+    assert (await client.delete(f"/api/rooms/{room}")).status_code == 403
+    await client.post("/api/logout")
+    client.cookies.clear()
+    assert (await client.get("/api/rooms")).status_code == 401
+
+
+async def test_agents_in_a_room(client):
+    ids, call = await room_setup(client)
+    room = (await client.post("/api/rooms", json={"name": "R", "members": [ids["a1"], ids["b1"]]})).json()["id"]
+    for sid in ("a1", "b1"):
+        await call(sid, "DeckInbox")  # the welcome notices
+    # only members post; a member's post reaches the other members, not itself, nor outsiders
+    assert (await call("a2", "DeckSend", to=f"room:{room}", text="let me in")).status_code == 400
+    assert (await call("a1", "DeckSend", to=f"room:{room}", text="PR 9 ready", ref="pr/9")).status_code == 200
+    assert (await call("a1", "DeckSend", to="room:nope", text="x")).status_code == 400
+    got = (await call("b1", "DeckInbox")).json()["messages"]
+    assert [(m["text"], m["room"]) for m in got] == [("PR 9 ready", room)]
+    assert (await call("a1", "DeckInbox")).json()["messages"] == []
+    assert (await call("a2", "DeckInbox")).json()["messages"] == []
+    # rooms and history, for members only; history does not deliver
+    rooms = (await call("b1", "DeckRooms")).json()["rooms"]
+    assert [r["id"] for r in rooms] == [room] and {m["you"] for m in rooms[0]["members"]} == {True, False}
+    assert [m["text"] for m in (await call("b1", "DeckRooms", room=room)).json()["messages"]] == ["PR 9 ready"]
+    assert (await call("a2", "DeckRooms", room=room)).status_code == 404
+    assert (await call("a2", "DeckRooms")).json() == {"rooms": []}
+    # a member joining later does not get earlier messages
+    a2_src, _ = ids["a2"].split(":")
+    await client.put(f"/api/rooms/{room}/members/{a2_src}/a2")
+    assert [m["to_kind"] for m in (await call("a2", "DeckInbox")).json()["messages"]] == ["session"]  # only the welcome
+    # leave
+    assert (await call("b1", "DeckLeave", room=room)).json() == {"left": True}
+    assert (await call("b1", "DeckLeave", room=room)).status_code == 404
+    await call("a1", "DeckSend", to=f"room:{room}", text="anyone?")
+    assert (await call("b1", "DeckInbox")).json()["messages"] == []
+
+
+async def test_room_posts_from_agents_do_not_wake_a_member_twice_in_a_row(client):
+    ids, call = await room_setup(client)
+    room = (await client.post("/api/rooms", json={"name": "R", "members": [ids["a1"], ids["b1"]]})).json()["id"]
+    await call("b1", "DeckInbox")
+    await call("a1", "DeckSend", to=f"room:{room}", text="one")
+    assert (await call("b1", "DeckWait")).json() == {"waiting": 1}  # wakes, and starts the cooldown
+    await call("b1", "DeckInbox")
+    await call("a1", "DeckSend", to=f"room:{room}", text="two")
+    assert (await call("b1", "DeckWait")).json() == {"waiting": 0}  # an agent again, too soon: waits for the next turn
+    assert len((await call("b1", "DeckInbox")).json()["messages"]) == 1  # still delivered
+    await client.post(f"/api/rooms/{room}/messages", json={"text": "from Rafa"})
+    assert (await call("b1", "DeckWait")).json() == {"waiting": 1}  # the board always wakes
+
+
+async def test_room_members_go_with_their_sessions(client, app):
+    ids, call = await room_setup(client)
+    room = (await client.post("/api/rooms", json={"name": "R", "members": [ids["a1"], ids["b1"]]})).json()["id"]
+    src, _ = ids["a1"].split(":")
+    assert (await client.delete(f"/api/sessions/{src}/a1")).status_code == 200
+    members = (await board(client))["rooms"][0]["members"]
+    assert [m["session_id"] for m in members] == ["b1"]
+    b_src = ids["b1"].split(":")[0]
+    await client.delete(f"/api/sources/{b_src}")
+    assert (await board(client))["rooms"][0]["members"] == []
+
+
+def test_closed_rooms_are_pruned_after_a_week(tmp_path, monkeypatch):
+    import time as _time
+    from crittersdeck.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    old, new = store.add_room("old"), store.add_room("new")
+    store.add_message({"created": _time.time(), "from_source": "", "from_session": "", "to_kind": "room",
+                       "to_source": "", "to_session": "", "text": "x", "ref": "", "room_id": old["id"]})
+    store.close_room(old["id"])
+    store.close_room(new["id"])
+    real = _time.time
+    monkeypatch.setattr("crittersdeck.store.time.time", lambda: real() + 3 * 86400)
+    store.prune(real())
+    assert {r["name"] for r in store.rooms()} == {"old", "new"}  # archived, still visible
+    monkeypatch.setattr("crittersdeck.store.time.time", lambda: real() + 8 * 86400)
+    store.prune(real())
+    assert store.rooms() == []
+    assert store.db.execute("SELECT COUNT(*) FROM messages WHERE to_kind = 'room'").fetchone()[0] == 0
+
+
+async def test_welcome_notice_fits_a_crowded_room(client, monkeypatch):
+    from crittersdeck import server
+
+    monkeypatch.setattr(server._Bucket, "take", lambda self: True)  # 31 sessions start at once
+    await sign_in(client)
+    a = await new_source(client, "A")
+    sids = [f"s{i:02d}" for i in range(31)]
+    for sid in sids:
+        await send(client, a["token"], event("UserPromptSubmit", sid=sid, prompt=f"{sid} " + "a very long title " * 10))
+    inbox = lambda sid: send(client, a["token"], {"hook_event_name": "DeckInbox", "session_id": sid})
+    await inbox(sids[0])  # the machine takes part in messaging
+    sid_of = lambda s: f"{a['source']['id']}:{s}"
+    room = (await client.post("/api/rooms", json={"name": "Crowd", "members": [sid_of(s) for s in sids[:30]]})).json()["id"]
+    for i, sid in enumerate(sids[:30]):  # every member got its welcome, each within the message limit
+        got = [m for m in (await inbox(sid)).json()["messages"] if "Crowd" in m["text"]]
+        assert len(got) == 1 and len(got[0]["text"]) <= 4000, sid
+        assert (f"and {i - 10} more" in got[0]["text"]) == (i > 10)
+    r = await client.put(f"/api/rooms/{room}/members/{a['source']['id']}/{sids[30]}")
+    assert r.status_code == 409 and "30 members" in r.json()["detail"]
+
+
+async def test_room_limits_and_messaging_off(client, monkeypatch):
+    from crittersdeck import server
+
+    monkeypatch.setattr(server, "ROOMS_MAX", 3)
+    ids, call = await room_setup(client)
+    for name in ("r1", "r2", "r3"):
+        assert (await client.post("/api/rooms", json={"name": name})).status_code == 200
+    r = await client.post("/api/rooms", json={"name": "r4"})
+    assert r.status_code == 409 and "3 open rooms" in r.json()["detail"]
+    room = (await board(client))["rooms"][0]["id"]
+    await client.delete(f"/api/rooms/{room}")  # a closed room frees a place
+    assert (await client.post("/api/rooms", json={"name": "r4"})).status_code == 200
+    # a machine with messaging off (it never asks for its inbox) cannot be added, and a failed create leaves nothing
+    monkeypatch.setattr(server, "ROOMS_MAX", 50)
+    c = await new_source(client, "Quiet")
+    await send(client, c["token"], event("UserPromptSubmit", sid="q1", prompt="quiet"))
+    q1 = f"{c['source']['id']}:q1"
+    before = len((await board(client))["rooms"])
+    r = await client.post("/api/rooms", json={"name": "r5", "members": [ids["a1"], q1]})
+    assert r.status_code == 409 and "off" in r.json()["detail"]
+    assert len((await board(client))["rooms"]) == before  # no half-made room
+    assert all("r5" not in m["text"] for m in (await call("a1", "DeckInbox")).json()["messages"])
+    r = await client.put(f"/api/rooms/{room}/members/{c['source']['id']}/q1")
+    assert r.status_code == 409
+
+
+async def test_agents_ping_ponging_pause_the_room_until_the_board_speaks(client, monkeypatch):
+    from crittersdeck import server
+
+    monkeypatch.setattr(server, "WAKE_COOLDOWN", 0)
+    ids, call = await room_setup(client)
+    room = (await client.post("/api/rooms", json={"name": "R", "members": [ids["a1"], ids["b1"]]})).json()["id"]
+    for sid in ("a1", "b1"):
+        await call(sid, "DeckInbox")
+    wakes = []
+    for turn in range(8):  # two agents that always answer each other
+        me, other = ("a1", "b1") if turn % 2 == 0 else ("b1", "a1")
+        await call(me, "DeckSend", to=f"room:{room}", text=f"reply {turn}")
+        wakes.append((await call(other, "DeckWait")).json()["waiting"])
+        assert len((await call(other, "DeckInbox")).json()["messages"]) == 1  # always delivered
+    assert wakes == [1] * 6 + [0, 0]  # six wakes, then the room is paused
+    assert (await board(client))["rooms"][0]["paused"] is True
+    await client.post(f"/api/rooms/{room}/messages", json={"text": "keep going"})
+    assert (await call("a1", "DeckWait")).json()["waiting"] == 1
+    assert (await board(client))["rooms"][0]["paused"] is False
+    await call("a1", "DeckInbox")
+    await call("b1", "DeckInbox")
+    await call("b1", "DeckSend", to=f"room:{room}", text="again")
+    assert (await call("a1", "DeckWait")).json()["waiting"] == 1  # agents wake each other again
+
+
+def test_old_database_gets_rooms(tmp_path):
+    from crittersdeck.store import Store
+
+    db = sqlite3.connect(tmp_path / "old.db")
+    db.executescript("""CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL NOT NULL,
+        from_source TEXT NOT NULL DEFAULT '', from_session TEXT NOT NULL DEFAULT '', to_kind TEXT NOT NULL,
+        to_source TEXT NOT NULL DEFAULT '', to_session TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '');
+        INSERT INTO messages (created, to_kind, text) VALUES (1, 'all', 'old');""")
+    db.commit()
+    db.close()
+    store = Store(str(tmp_path / "old.db"))
+    assert [tuple(r) for r in store.db.execute("SELECT room_id, text FROM messages")] == [("", "old")]
+    assert store.db.execute("SELECT 1 FROM sqlite_master WHERE name = 'messages_room'").fetchone()
+    assert store.rooms() == []
+
+
+def test_prune_drops_members_of_pruned_sessions(tmp_path):
+    import time as _time
+    from crittersdeck.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    src, _ = store.add_source("A", "#ff0000")
+    now = _time.time()
+    for sid, status, updated in (("live", "idle", now), ("gone", "ended", now - 3 * 86400)):
+        store.save_session(src["id"], sid, {"status": status, "started": updated, "updated": updated})
+    room = store.add_room("R")
+    for sid in ("live", "gone"):
+        store.add_member(room["id"], src["id"], sid)
+    store.prune(now - 86400)
+    assert [m["session_id"] for m in store.rooms()[0]["members"]] == ["live"]
+
+
+async def test_room_history_counts_its_real_recipients(client):
+    ids, call = await room_setup(client)
+    room = (await client.post("/api/rooms", json={"name": "R", "members": [ids["a1"], ids["b1"]]})).json()["id"]
+    await call("a1", "DeckSend", to=f"room:{room}", text="before a2")
+    a2_src = ids["a2"].split(":")[0]
+    await client.put(f"/api/rooms/{room}/members/{a2_src}/a2")  # joined after: not a recipient of the first
+    await call("b1", "DeckInbox")
+    await client.post(f"/api/rooms/{room}/messages", json={"text": "from the board"})
+    history = (await client.get(f"/api/rooms/{room}/messages")).json()
+    assert [(m["text"], m["delivered"], m["recipients"]) for m in history] == [
+        ("before a2", 1, 1),  # b1 only: not the sender, not a2
+        ("from the board", 0, 3)]
+
+
+def test_rooms_listing_is_indexed_and_grouped(tmp_path):
+    from crittersdeck.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    assert store.db.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'messages_room'").fetchone()
+    r1, r2 = store.add_room("one"), store.add_room("two")
+    for t in (1.0, 2.0):
+        store.add_message({"created": t, "from_source": "", "from_session": "", "to_kind": "room", "to_source": "",
+                           "to_session": "", "text": "x", "ref": "", "room_id": r1["id"]})
+    store.add_member(r2["id"], "src", "sid")
+    got = {r["name"]: (r["messages"], r["last"], [m["session_id"] for m in r["members"]]) for r in store.rooms()}
+    assert got == {"one": (2, 2.0, []), "two": (0, None, ["sid"])}
+    assert store.room_names() == {r1["id"]: "one", r2["id"]: "two"}
+
+
+def test_dropping_a_room_takes_its_welcome_notices(tmp_path):
+    from crittersdeck.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    room, other = store.add_room("R"), store.add_room("O")
+    for rid in (room["id"], other["id"]):
+        store.add_message({"created": 1.0, "from_source": "", "from_session": "", "to_kind": "session", "to_source": "a",
+                           "to_session": "b", "text": f'You were added to the room "x" (room:{rid}).', "ref": ""})
+    store.drop_room(room["id"])
+    assert [r[0] for r in store.db.execute("SELECT text FROM messages")] == [f'You were added to the room "x" (room:{other["id"]}).']

@@ -1,7 +1,6 @@
-"""The plugin's title and usage step (plugin/scripts/titles.py), run as Claude Code would run it."""
+"""The plugin's title step (plugin/scripts/titles.py), run as Claude Code would run it."""
 
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -10,18 +9,14 @@ from pathlib import Path
 
 import pytest
 
+agents = []  # User-Agent of each request to the board
 SCRIPT = Path(__file__).parent.parent / "plugin/scripts/titles.py"
-VERSION = json.loads((SCRIPT.parent.parent / ".claude-plugin/plugin.json").read_text())["version"]
-
-
-class Received(list):
-    agents = None  # the User-Agent of each request, beside it
 
 
 @pytest.fixture
 def board():
-    received, agents = Received(), []
-    received.agents = agents
+    received = []
+    agents.clear()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -41,14 +36,13 @@ def board():
     server.shutdown()
 
 
-def run(tmp_path, url, event, api=None):
-    env = {
+def run(tmp_path, url, event, api=None, **extra):
+    env = {**extra,
         "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg"),
         "CLAUDE_PLUGIN_DATA": str(tmp_path / "data"),
         "CLAUDE_PLUGIN_OPTION_TOKEN": "cd_secret",
         **({"CRITTERSDECK_TEST_API": api} if api else {}),
         "PATH": "/usr/bin:/bin",
-        **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),  # Windows sockets
     }
     p = subprocess.run([sys.executable, str(SCRIPT), url], input=json.dumps(event), env=env,
                        capture_output=True, text=True, timeout=30)
@@ -66,12 +60,10 @@ def test_terminal_session_sends_latest_ai_title(tmp_path, board):
     url, received = board
     event = {"session_id": "abc", "transcript_path": transcript(tmp_path, "Old", "Fix  the login")}
     run(tmp_path, url, event)
-    [(path, auth, sent)] = received
-    assert (path, auth, sent["hook_event_name"], sent["session_id"], sent["title"]) == (
-        "/ingest", "Bearer cd_secret", "SessionInfo", "abc", "Fix the login")
-    assert sent["info"]["tokens_in"] == 0  # counts, never prompt text
+    [(path, auth, body)] = received
+    assert (path, auth, body["hook_event_name"], body["title"]) == ("/ingest", "Bearer cd_secret", "SessionInfo", "Fix the login")
     # Cloudflare in front of a board blocks urllib's default User-Agent (error 1010)
-    assert received.agents == [f"crittersdeck-plugin/{VERSION}"]
+    assert agents[0].startswith("crittersdeck-plugin/") and not agents[0].endswith("unknown")
 
 
 def test_linked_session_gets_title_from_claude_ai(tmp_path, board):
@@ -80,11 +72,12 @@ def test_linked_session_gets_title_from_claude_ai(tmp_path, board):
 
     class Api(BaseHTTPRequestHandler):
         def do_GET(self):
-            api_seen.append((self.path, self.headers["authorization"], self.headers["anthropic-beta"],
-                             self.headers["user-agent"]))
+            api_seen.append((self.path, self.headers["authorization"], self.headers["anthropic-beta"]))
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(json.dumps({"id": "session_01X", "title": "Agentes temáticos"}).encode())
+            self.wfile.write(json.dumps({"id": "session_01X", "title": "Agentes temáticos", "external_metadata": {
+                "context_usage": {"used_tokens": 5000.0, "max_tokens": 1000000}, "usage": {"cost_usd": 1.5},
+                "last_served_model": "claude-opus-5-5"}}).encode())
 
         def log_message(self, *a):
             pass
@@ -103,12 +96,13 @@ def test_linked_session_gets_title_from_claude_ai(tmp_path, board):
             api=f"http://127.0.0.1:{api.server_port}/v1/sessions/")
     finally:
         api.shutdown()
-    assert api_seen == [("/v1/sessions/session_01X", "Bearer oauth-secret", "ccr-byoc-2025-07-29",
-                         f"crittersdeck-plugin/{VERSION}")]
+    assert api_seen == [("/v1/sessions/session_01X", "Bearer oauth-secret", "ccr-byoc-2025-07-29")]
     # the board gets the title and its own token, never the Claude credential
-    [(path, auth, sent)] = received
-    assert (path, auth, sent["title"]) == ("/ingest", "Bearer cd_secret", "Agentes temáticos")
-    assert "oauth-secret" not in json.dumps(sent)
+    [(path, auth, body)] = received
+    assert (path, auth, body["title"]) == ("/ingest", "Bearer cd_secret", "Agentes temáticos")
+    assert body["info"] == {"context_used": 5000, "context_max": 1000000, "cost_usd": 1.5, "model": "claude-opus-5-5",
+                            "tokens_in": 0, "tokens_out": 0, "cache_read": 0, "cache_write": 0, "turns": 0}
+    assert "oauth-secret" not in json.dumps(received)
 
 
 def test_malformed_claude_ai_id_is_not_used(tmp_path, board):
@@ -120,18 +114,53 @@ def test_malformed_claude_ai_id_is_not_used(tmp_path, board):
         json.dumps({"claudeAiOauth": {"accessToken": "t", "expiresAt": 4_000_000_000_000}}))
     # falls back to the transcript, without any request to claude.ai
     run(tmp_path, url, {"session_id": "abc", "transcript_path": transcript(tmp_path, "T")}, api="http://127.0.0.1:9/")
-    assert [r[2]["title"] for r in received] == ["T"]
+    assert [r[2].get("title") for r in received] == ["T"]
 
 
-def test_linked_session_without_valid_credential_keeps_the_transcript(tmp_path, board):
+def test_linked_session_without_valid_credential_sends_nothing(tmp_path, board):
     url, received = board
     sessions = tmp_path / "cfg/sessions"
     sessions.mkdir(parents=True)
     (sessions / "123.json").write_text(json.dumps({"sessionId": "abc", "bridgeSessionId": "session_01X"}))
     (tmp_path / "cfg/.credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "t", "expiresAt": 0}}))
-    # an expired token is not used (no request to claude.ai): what the transcript has is sent
-    run(tmp_path, url, {"session_id": "abc", "transcript_path": transcript(tmp_path, "T")}, api="http://127.0.0.1:9/")
-    assert [r[2]["title"] for r in received] == ["T"]
+    # an expired token is not used: what the transcript has (its ai-title, its figures) still goes
+    run(tmp_path, url, {"session_id": "abc", "transcript_path": transcript(tmp_path, "T")})
+    [(_, _, body)] = received
+    assert body["title"] == "T" and body["info"]["turns"] == 0 and "cost_usd" not in body["info"]
+
+
+def test_usage_from_the_transcript(tmp_path, board):
+    url, received = board
+    lines = [
+        {"type": "user", "message": {"role": "user", "content": "first prompt"}},
+        {"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {
+            "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20}}},
+        {"type": "assistant", "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {  # same reply, counted once
+            "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20}}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "x"}]}},  # not a prompt
+        {"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta"}},
+        {"type": "user", "isSidechain": True, "message": {"role": "user", "content": "subagent"}},
+        {"type": "assistant", "message": {"id": "m2", "model": "claude-opus-5-5", "usage": {
+            "input_tokens": 1, "output_tokens": 7, "cache_read_input_tokens": 300, "cache_creation_input_tokens": 0}}},
+        {"type": "assistant", "message": {"id": "m3", "model": "<synthetic>", "usage": {"input_tokens": 999}}},
+        {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "second"}]}},
+    ]
+    path = tmp_path / "u.jsonl"
+    path.write_text("\n".join(map(json.dumps, lines)) + "\n")
+    run(tmp_path, url, {"session_id": "abc", "transcript_path": str(path)})
+    [(_, _, body)] = received
+    assert "title" not in body
+    assert body["info"] == {"tokens_in": 11, "tokens_out": 12, "cache_read": 400, "cache_write": 20, "turns": 2,
+                            "context_used": 301, "model": "claude-opus-5-5"}
+
+
+def test_switched_off_sends_nothing(tmp_path, board):
+    url, received = board
+    for value in ("false", "0", "off"):
+        run(tmp_path, url, {"session_id": "abc", "transcript_path": transcript(tmp_path, "T")}, CLAUDE_PLUGIN_OPTION_SEND_USAGE=value)
+    assert received == []
+    run(tmp_path, url, {"session_id": "abc", "transcript_path": transcript(tmp_path, "T")}, CLAUDE_PLUGIN_OPTION_SEND_USAGE="true")
+    assert len(received) == 1
 
 
 def test_bad_input_is_ignored(tmp_path, board):

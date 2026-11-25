@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -25,10 +26,23 @@ from fastapi.staticfiles import StaticFiles
 
 from . import auth, state
 from .approvals import ALLOW, DENY, Approvals, hook_reply
-from .snippet import EVENTS, TITLE_EVENT, hooks_block, install_commands
+from . import __version__
+from .snippet import EVENTS, INFO_EVENT, TITLE_EVENT, hooks_block, install_commands
 from .store import Store
 
 ANSWER = "answer"  # answers to AskUserQuestion, from the board
+# Messages between sessions (the plugin's deck_* tools and its delivery hooks).
+AGENT_EVENTS = ("DeckPeers", "DeckSend", "DeckInbox", "DeckWait", "DeckRooms", "DeckLeave")
+ROOMS_MAX, ROOM_MEMBERS_MAX, ROOM_NAME_MAX = 50, 30, 40
+WELCOME_NAMES = 10            # members named in the welcome notice
+ROOM_HISTORY = 30             # messages an agent gets when it asks for a room's history
+WAKE_COOLDOWN = 120           # an agent's room post does not wake a member this room woke this recently
+ROOM_AGENT_WAKES = 6          # wakes from agents' posts in a room before it pauses until the board posts
+WAIT_MAX = 50  # long-poll cap, seconds: under the ~100 s idle limit of proxies such as Cloudflare
+MESSAGE_MAX, REF_MAX = 4000, 300
+MESSAGES_PER_MINUTE = 10      # per source, on top of the ingest rate limit
+DELIVERY_CHARS = 8000         # per delivery: the rest waits for the next one
+MESSAGING_SEEN_FOR = 3 * 86400  # a source that asked for its inbox lately has messaging on
 MAX_BODY = 256 * 1024
 FULL_INPUT_MAX = 4000
 NAME_MAX = 120
@@ -178,6 +192,35 @@ def answered_input(tool_input, answers):
     return {**tool_input, "answers": out}
 
 
+# Session usage the board keeps: counts only, plus the model's name.
+_INFO_COUNTS = ("context_used", "context_max", "tokens_in", "tokens_out", "cache_read", "cache_write", "turns")
+
+
+def clean_info(info):
+    """Usage figures from the plugin, checked; None if anything is off."""
+    if not isinstance(info, dict) or not set(info) <= {*_INFO_COUNTS, "cost_usd", "model"}:
+        return None
+    out = {}
+    for k in _INFO_COUNTS:
+        v = info.get(k)
+        if v is None:
+            continue
+        if type(v) is not int or not 0 <= v < 10**13:
+            return None
+        out[k] = v
+    cost = info.get("cost_usd")
+    if cost is not None:
+        if type(cost) not in (int, float) or not 0 <= cost < 10**7:
+            return None
+        out["cost_usd"] = round(float(cost), 4)
+    model = info.get("model")
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            return None
+        out["model"] = "".join(map(_visible, model.strip()))[:80]
+    return out
+
+
 def is_private_url(url):
     host = urlsplit(url).hostname or ""
     if host == "localhost":
@@ -224,6 +267,11 @@ def create_apps(settings=None):
     login_bucket = _Bucket(rate=LOGIN_FAILURES_PER_MINUTE / 60, capacity=LOGIN_FAILURES_PER_MINUTE,
                            tokens=LOGIN_FAILURES_PER_MINUTE)
     subscribers = set()
+    messaging = {}  # source id -> when it last asked for its inbox
+    message_buckets = {}
+    held = {}  # source id -> DeckWait requests being held
+    woken = {}  # (source, session, room) -> when a room's message last woke that member
+    agent_wakes = {}  # room id -> wakes caused by agents' posts since the board last posted there
 
     def broadcast():
         for q in list(subscribers):
@@ -233,17 +281,23 @@ def create_apps(settings=None):
     def snapshot():
         now = time.time()
         pending = {(p["source_id"], p["session_id"]): p for p in approvals.pending()}
+        rows = store.sessions()
+        unread = store.unread({(s["source_id"], s["session_id"]): s["started"] for s in rows if s["status"] != state.ENDED})
         sessions = []
-        for s in store.sessions():
+        for s in rows:
             p = pending.get((s["source_id"], s["session_id"]))
             status = state.NEEDS_YOU if p else state.effective_status(s, now, settings.idle_minutes * 60)
-            sessions.append({**s, "status": status, "pending": p})
-        return {"now": now, "sources": store.sources(), "sessions": sessions}
+            sessions.append({**s, "info": json.loads(s["info"] or "{}"), "status": status, "pending": p,
+                             "unread": unread.get((s["source_id"], s["session_id"]), 0)})
+        rooms = [{**r, "paused": agent_wakes.get(r["id"], 0) >= ROOM_AGENT_WAKES} for r in store.rooms()]
+        return {"now": now, "sources": store.sources(), "sessions": sessions, "rooms": rooms}
 
     async def tick():
         while True:
             await asyncio.sleep(30)
             store.prune(time.time() - settings.ended_hours * 3600)
+            for k in [k for k, t in woken.items() if time.time() - t > WAKE_COOLDOWN]:
+                del woken[k]
             broadcast()  # idle transitions happen with time, not events
 
     def secure_headers(app):
@@ -285,8 +339,10 @@ def create_apps(settings=None):
             return JSONResponse({"error": "missing or bad session_id"}, status_code=400)
         name = event.get("hook_event_name")
         sid = source["id"]
-        if name == TITLE_EVENT:
-            return set_claude_title(sid, session_id, event.get("title"))
+        if name in AGENT_EVENTS:
+            return await agent_call(source, session_id, name, event)
+        if name in (INFO_EVENT, TITLE_EVENT):
+            return set_session_info(sid, session_id, event.get("title"), event.get("info") if name == INFO_EVENT else None)
         if name not in EVENTS:
             return JSONResponse({})  # an event this version does not use
 
@@ -333,19 +389,174 @@ def create_apps(settings=None):
 
         return StreamingResponse(wait_for_answer(), media_type="application/json")
 
-    def set_claude_title(source_id, session_id, title):
-        """The title Claude gave the session (sent by the crittersdeck-titles plugin). It replaces the
-        first-prompt title but not a name given on the board, and does not count as activity.
-        `applied` tells the sender whether to remember it as sent."""
-        if not isinstance(title, str) or not title.strip():
-            return JSONResponse({"error": "missing title"}, status_code=400)
+    def label(source_id, session_id):
+        """Who a message is from, as a person reads it."""
+        if not source_id:
+            return "the board"
+        src = next((x for x in store.sources() if x["id"] == source_id), None)
+        s = store.session(source_id, session_id)
+        title = (s or {}).get("title") or "untitled session"
+        return f"session \"{title}\" on {src['name'] if src else 'a deleted machine'} ({session_id[:8]})"
+
+    def message_view(m, names=None):
+        return {"id": m["id"], "created": m["created"], "from": label(m["from_source"], m["from_session"]),
+                "from_id": f"{m['from_source']}:{m['from_session']}" if m["from_source"] else "",
+                "from_board": not m["from_source"], "to_kind": m["to_kind"], "text": m["text"], "ref": m["ref"],
+                **({"room": m["room_id"], "room_name": (names if names is not None else store.room_names()).get(m["room_id"], "")}
+                   if m.get("room_id") else {})}
+
+    def taking_part(source_id):
+        return time.time() - messaging.get(source_id, 0) < MESSAGING_SEEN_FOR
+
+    def save_message(from_source, from_session, to, text, ref):
+        """Checks and stores a message; returns (id, error)."""
+        if not isinstance(text, str) or not text.strip() or len(text) > MESSAGE_MAX:
+            return None, f"text: 1 to {MESSAGE_MAX} characters"
+        if not isinstance(ref, str) or len(ref) > REF_MAX or any(c in ref for c in "\r\n"):
+            return None, f"ref: one line, up to {REF_MAX} characters"
+        room_id = ""
+        if isinstance(to, str) and to.startswith("room:"):
+            room = store.room(to[5:])
+            if room is None or room["closed"] is not None:
+                return None, "no such open room: use an id from deck_rooms"
+            if from_source and not any(r["id"] == room["id"] for r in store.member_rooms(from_source, from_session)):
+                return None, "this session is not a member of that room"
+            kind, to_src, to_sid, room_id = "room", "", "", room["id"]
+        elif to == "all":
+            kind, to_src, to_sid = "all", "", ""
+        elif isinstance(to, str) and ":" in to:
+            to_src, _, to_sid = to.partition(":")
+            if store.session(to_src, to_sid) is None or (from_source and not taking_part(to_src)):
+                return None, "no such session: use an id from deck_peers"
+            kind = "session"
+        elif isinstance(to, str) and to.strip():
+            src = next((x for x in store.sources() if x["name"].casefold() == to.strip().casefold()), None)
+            if src is None or (from_source and not taking_part(src["id"])):
+                return None, "no such machine: use a source name from deck_peers, a session id, or all"
+            kind, to_src, to_sid = "source", src["id"], ""
+        else:
+            return None, "to: a session id, a machine name, or all"
+        visible = lambda v: "".join(map(_visible, v))
+        mid = store.add_message({"created": time.time(), "from_source": from_source, "from_session": from_session,
+                                 "to_kind": kind, "to_source": to_src, "to_session": to_sid,
+                                 "text": visible(text.strip()), "ref": visible(ref.strip()), "room_id": room_id})
+        if room_id and not from_source:
+            agent_wakes.pop(room_id, None)  # the person spoke: agents' posts may wake members again
+        broadcast()
+        return mid, None
+
+    async def agent_call(source, session_id, name, event):
+        """The plugin, for one session: who else is there, send a message, read its inbox.
+
+        Only sources with messaging on take part: the server knows them because they ask for their
+        inbox. Others are neither listed nor reachable."""
+        sid = source["id"]
+        messaging[sid] = time.time()
+        me = store.session(sid, session_id)
+        if me is None:
+            return JSONResponse({"error": "this session is not on the board yet"}, status_code=409)
+        if name == "DeckPeers":
+            names = {x["id"]: x["name"] for x in store.sources()}
+            now = time.time()
+            peers = [{"id": f"{s['source_id']}:{s['session_id']}", "machine": names.get(s["source_id"], "?"),
+                      "title": s["title"] or "untitled session", "folder": s["folder"],
+                      "status": state.effective_status(s, now, settings.idle_minutes * 60),
+                      "you": (s["source_id"], s["session_id"]) == (sid, session_id)}
+                     for s in store.sessions() if s["status"] != state.ENDED and taking_part(s["source_id"])]
+            machines = sorted(names[x] for x in names if taking_part(x))
+            return JSONResponse({"peers": peers, "machines": machines})
+        if name == "DeckSend":
+            if not message_buckets.setdefault(sid, _Bucket(rate=MESSAGES_PER_MINUTE / 60, capacity=MESSAGES_PER_MINUTE,
+                                                           tokens=MESSAGES_PER_MINUTE)).take():
+                return JSONResponse({"error": f"at most {MESSAGES_PER_MINUTE} messages a minute"}, status_code=429)
+            mid, error = save_message(sid, session_id, event.get("to"), event.get("text"), event.get("ref", ""))
+            return JSONResponse({"error": error}, status_code=400) if error else JSONResponse({"sent": mid})
+        if name == "DeckRooms":
+            room_id = event.get("room")
+            mine = store.member_rooms(sid, session_id)
+            if room_id:  # one room's history; nothing is marked delivered
+                if not any(r["id"] == room_id for r in mine):
+                    return JSONResponse({"error": "this session is not a member of that room"}, status_code=404)
+                names = store.room_names()
+                return JSONResponse({"messages": [message_view(m, names) for m in store.room_messages(room_id, ROOM_HISTORY)]})
+            members = {r["id"]: r["members"] for r in store.rooms()}
+            return JSONResponse({"rooms": [{"id": r["id"], "name": r["name"], "members": [
+                {"id": f"{m['source_id']}:{m['session_id']}", "label": label(m["source_id"], m["session_id"]),
+                 "you": (m["source_id"], m["session_id"]) == (sid, session_id)} for m in members.get(r["id"], [])]}
+                for r in mine]})
+        if name == "DeckLeave":
+            if not store.remove_member(str(event.get("room") or ""), sid, session_id):
+                return JSONResponse({"error": "this session is not a member of that room"}, status_code=404)
+            broadcast()
+            return JSONResponse({"left": True})
+        if name == "DeckWait":
+            return JSONResponse({"waiting": await waiting(sid, session_id, me["started"], event.get("wait"))})
+        rows = store.inbox(sid, session_id, me["started"], max_chars=DELIVERY_CHARS)
+        if rows:
+            broadcast()
+        names = store.room_names()
+        return JSONResponse({"messages": [message_view(m, names) for m in rows]})
+
+    async def waiting(source_id, session_id, since, wait):
+        """How many messages wait for a session, without delivering them. With `wait` (seconds, capped),
+        holds the request until there is at least one or the time is up (long-poll for `deck.py wait`)."""
+        key = (source_id, session_id)
+        ok = isinstance(wait, (int, float)) and not isinstance(wait, bool) and math.isfinite(wait)  # NaN would hold forever
+        wait = min(max(wait, 0), WAIT_MAX) if ok else 0
+        if held.get(source_id, 0) >= MAX_SESSIONS_PER_SOURCE:
+            wait = 0  # one held request per session is all the plugin needs: answer the rest at once
+        deadline = time.monotonic() + wait
+        queue = asyncio.Queue()
+        subscribers.add(queue)  # woken by every broadcast, which every new message makes
+        held[source_id] = held.get(source_id, 0) + 1
+        try:
+            while True:
+                rows = store.pending(source_id, session_id, since)
+                now = time.time()
+                # Agents in a room answering each other: a room wakes a member at most every WAKE_COOLDOWN s,
+                # and after ROOM_AGENT_WAKES wakes from agents' posts it wakes nobody until the board posts.
+                # The messages are still delivered on each member's next turn.
+                waking = [(room, sender) for room, sender in rows if not (room and sender and (
+                    agent_wakes.get(room, 0) >= ROOM_AGENT_WAKES or now - woken.get((*key, room), 0) < WAKE_COOLDOWN))]
+                left = deadline - time.monotonic()
+                if waking:
+                    rooms_waking = {room for room, _ in waking if room}
+                    for room in rooms_waking:
+                        woken[(*key, room)] = now
+                    by_agents = rooms_waking - {room for room, sender in waking if room and not sender}
+                    for room in by_agents:
+                        agent_wakes[room] = agent_wakes.get(room, 0) + 1
+                    if any(agent_wakes[room] >= ROOM_AGENT_WAKES for room in by_agents):
+                        broadcast()  # the room view shows it is paused
+                    return len(rows)
+                if left <= 0:
+                    return 0
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(queue.get(), left)
+        finally:
+            subscribers.discard(queue)
+            held[source_id] -= 1
+
+    def set_session_info(source_id, session_id, title, info):
+        """What the crittersdeck plugin reads on the machine (send_usage option): the title Claude gave the session
+        and its usage (tokens, context, model, cost). The title replaces the first-prompt one but not a
+        name given on the board. Neither counts as activity. `applied`: the board knows the session."""
+        if title is not None and (not isinstance(title, str) or not title.strip()):
+            return JSONResponse({"error": "bad title"}, status_code=400)
+        usage = clean_info(info) if info is not None else None
+        if (info is not None and usage is None) or (title is None and not usage):
+            return JSONResponse({"error": "bad session info"}, status_code=400)
         s = store.session(source_id, session_id)
         if s is None:  # only sessions the hooks already reported
             return JSONResponse({"applied": False})
-        title = "".join(map(_visible, " ".join(title.split())))[:NAME_MAX]
-        if not s["renamed"] and title != s["title"]:
+        new = dict(s)
+        if title is not None and not s["renamed"]:
+            new["title"] = "".join(map(_visible, " ".join(title.split())))[:NAME_MAX]
+        if usage:  # merged: figures this event lacks (claude.ai unreachable) keep their last value
+            new["info"] = json.dumps({**json.loads(s["info"] or "{}"), **usage}, sort_keys=True)
+        if new != s:
             try:
-                store.save_session(source_id, session_id, {**s, "title": title})
+                store.save_session(source_id, session_id, new)
             except sqlite3.IntegrityError:  # the source was deleted while this event was in flight
                 return JSONResponse({"error": "unknown source"}, status_code=401)
             broadcast()
@@ -421,7 +632,9 @@ def create_apps(settings=None):
     @board.get("/api/me")
     async def me(request: Request):
         user, csrf = require_user(request)
-        return {"user": user, "csrf": csrf, "password_login": bool(settings.password_hash)}
+        return {"user": user, "csrf": csrf, "password_login": bool(settings.password_hash),
+                "version": __version__, "public_url": settings.public_url,
+                "plugin_marketplace": settings.plugin_marketplace, "idle_minutes": settings.idle_minutes}
 
     # ---- board data ------------------------------------------------------------
 
@@ -503,6 +716,26 @@ def create_apps(settings=None):
         broadcast()
         return {}
 
+    @board.get("/api/sessions/{source_id}/{session_id}/messages")
+    async def thread(source_id: str, session_id: str, request: Request):
+        require_user(request)
+        if store.session(source_id, session_id) is None:
+            raise HTTPException(404, "no such session")
+        return [{**message_view(m), "delivered": bool(m["delivered"]),
+                 "outgoing": (m["from_source"], m["from_session"]) == (source_id, session_id)}
+                for m in store.thread(source_id, session_id)]
+
+    @board.post("/api/sessions/{source_id}/{session_id}/messages")
+    async def write(source_id: str, session_id: str, request: Request):
+        require_user(request, mutating=True)
+        if store.session(source_id, session_id) is None:
+            raise HTTPException(404, "no such session")
+        body = await json_body(request)
+        mid, error = save_message("", "", f"{source_id}:{session_id}", body.get("text"), body.get("ref", ""))
+        if error:
+            raise HTTPException(400, error)
+        return {"sent": mid}
+
     @board.delete("/api/sessions/{source_id}/{session_id}")
     async def forget(source_id: str, session_id: str, request: Request):
         require_user(request, mutating=True)
@@ -552,6 +785,137 @@ def create_apps(settings=None):
             raise HTTPException(404, "no such source")
         broadcast()
         return {}
+
+    # ---- rooms: managed on the board only -------------------------------------------------
+
+    def room_name(value, except_id=None):
+        name = " ".join(value.split()) if isinstance(value, str) else ""
+        name = "".join(map(_visible, name))
+        if not 0 < len(name) <= ROOM_NAME_MAX:
+            raise HTTPException(400, f"name: 1 to {ROOM_NAME_MAX} characters")
+        if any(r["name"].casefold() == name.casefold() and r["closed"] is None and r["id"] != except_id
+               for r in store.rooms()):
+            raise HTTPException(409, "an open room with that name already exists")
+        return name
+
+    def open_room(room_id):
+        room = store.room(room_id)
+        if room is None:
+            raise HTTPException(404, "no such room")
+        if room["closed"] is not None:
+            raise HTTPException(409, "the room is closed")
+        return room
+
+    def join(room, source_id, session_id):
+        """Adds a session; it gets a welcome notice (no history: it asks for it with deck_rooms)."""
+        s = store.session(source_id, session_id)
+        if s is None:
+            raise HTTPException(404, "no such session")
+        if s["status"] == state.ENDED:
+            raise HTTPException(409, "the session has ended")
+        if not taking_part(source_id):
+            raise HTTPException(409, "messages between agents are off on that session's machine (plugin setting)")
+        members = next((r["members"] for r in store.rooms() if r["id"] == room["id"]), [])
+        others = [(m["source_id"], m["session_id"]) for m in members]
+        if (source_id, session_id) in others:
+            return False
+        if len(others) >= ROOM_MEMBERS_MAX:
+            raise HTTPException(409, f"a room has at most {ROOM_MEMBERS_MAX} members")
+        store.add_member(room["id"], source_id, session_id)
+        # Members are listed up to WELCOME_NAMES, so the notice stays under MESSAGE_MAX with long titles.
+        names = "; ".join(label(*k)[:200] for k in others[:WELCOME_NAMES]) or "only you so far"
+        more = f" and {len(others) - WELCOME_NAMES} more (see deck_rooms)" if len(others) > WELCOME_NAMES else ""
+        _, error = save_message("", "", f"{source_id}:{session_id}",
+                                f"You were added to the room \"{room['name']}\" (room:{room['id']}). Members: {names}{more}."
+                                f" Messages posted there from now on reach you. Read its history with deck_rooms, write with"
+                                f" deck_send to room:{room['id']}, leave with deck_leave.", "")
+        if error:  # never a silent member: undo, and say why
+            store.remove_member(room["id"], source_id, session_id)
+            raise HTTPException(500, f"could not send the welcome notice: {error}")
+        return True
+
+    @board.get("/api/rooms")
+    async def list_rooms(request: Request):
+        require_user(request)
+        return store.rooms()
+
+    @board.post("/api/rooms")
+    async def create_room(request: Request):
+        require_user(request, mutating=True)
+        data = await json_body(request)
+        name = room_name(data.get("name"))
+        if sum(1 for r in store.rooms() if r["closed"] is None) >= ROOMS_MAX:
+            raise HTTPException(409, f"at most {ROOMS_MAX} open rooms")
+        members = data.get("members") or []
+        if not isinstance(members, list) or not all(isinstance(m, str) and ":" in m for m in members):
+            raise HTTPException(400, "members: a list of session ids (source:session)")
+        for m in members:  # all checked before the room exists or anyone is welcomed: no half-made room
+            s = store.session(*m.split(":", 1))
+            if s is None or s["status"] == state.ENDED:
+                raise HTTPException(404, f"no live session {m}")
+            if not taking_part(s["source_id"]):
+                raise HTTPException(409, f"messages between agents are off on the machine of {m} (plugin setting)")
+        room = store.add_room(name)
+        try:
+            for m in members[:ROOM_MEMBERS_MAX]:
+                join(room, *m.split(":", 1))
+        except HTTPException:
+            store.drop_room(room["id"])  # all or nothing: never a half-made room
+            raise
+        broadcast()
+        return room
+
+    @board.patch("/api/rooms/{room_id}")
+    async def rename_room(room_id: str, request: Request):
+        require_user(request, mutating=True)
+        open_room(room_id)
+        store.rename_room(room_id, room_name((await json_body(request)).get("name"), except_id=room_id))
+        broadcast()
+        return {}
+
+    @board.delete("/api/rooms/{room_id}")
+    async def close_room(room_id: str, request: Request):
+        require_user(request, mutating=True)
+        open_room(room_id)
+        store.close_room(room_id)  # archived: read-only, kept a week
+        agent_wakes.pop(room_id, None)
+        broadcast()
+        return {}
+
+    @board.put("/api/rooms/{room_id}/members/{source_id}/{session_id}")
+    async def add_member(room_id: str, source_id: str, session_id: str, request: Request):
+        require_user(request, mutating=True)
+        added = join(open_room(room_id), source_id, session_id)
+        broadcast()
+        return {"added": added}
+
+    @board.delete("/api/rooms/{room_id}/members/{source_id}/{session_id}")
+    async def remove_member(room_id: str, source_id: str, session_id: str, request: Request):
+        require_user(request, mutating=True)
+        open_room(room_id)
+        if not store.remove_member(room_id, source_id, session_id):
+            raise HTTPException(404, "not a member")
+        broadcast()
+        return {}
+
+    @board.get("/api/rooms/{room_id}/messages")
+    async def room_history(room_id: str, request: Request, before: int | None = None):
+        require_user(request)
+        if store.room(room_id) is None:
+            raise HTTPException(404, "no such room")
+        names = store.room_names()
+        return [{**message_view(m, names), "delivered": m["delivered"], "recipients": m["recipients"]}
+                for m in store.room_messages(room_id, 50, before)]
+
+    @board.post("/api/rooms/{room_id}/messages")
+    async def post_room(room_id: str, request: Request):
+        require_user(request, mutating=True)
+        open_room(room_id)
+        body = await json_body(request)
+        mid, error = save_message("", "", f"room:{room_id}", body.get("text"), body.get("ref", ""))
+        if error:
+            raise HTTPException(400, error)
+        return {"sent": mid}
 
     @board.get("/healthz")
     async def healthz():

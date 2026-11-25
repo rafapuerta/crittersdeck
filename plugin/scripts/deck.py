@@ -132,9 +132,22 @@ def tool(url, token, session_id, name, args):
     return f"Unknown tool {name}", True
 
 
+def current_session():
+    """The id of the session this server works for. A resumed session changes id after the server
+    started, so it is read on each call from Claude Code's registry of its running process."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    try:
+        with open(os.path.join(config, "sessions", f"{os.getppid()}.json"), encoding="utf-8") as f:
+            sid = json.load(f).get("sessionId")
+        if isinstance(sid, str) and sid:
+            return sid
+    except (OSError, ValueError, AttributeError):
+        pass
+    return os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+
+
 def serve(url):
     token = os.environ.get("DECK_TOKEN", "")
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for line in sys.stdin:
         try:
             msg = json.loads(line)
@@ -145,12 +158,12 @@ def serve(url):
             continue  # a notification: nothing to answer
         if method == "initialize":
             result = {"protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
-                      "capabilities": {"tools": {}}, "serverInfo": {"name": "crittersdeck", "version": "0.3.0"}}
+                      "capabilities": {"tools": {}}, "serverInfo": {"name": "crittersdeck", "version": "0.3.1"}}
         elif method == "tools/list":
             result = {"tools": TOOLS}
         elif method == "tools/call":
             params = msg.get("params") or {}
-            text, error = tool(url, token, session_id, params.get("name"), params.get("arguments") or {})
+            text, error = tool(url, token, current_session(), params.get("name"), params.get("arguments") or {})
             result = {"content": [{"type": "text", "text": text}], "isError": error}
         elif method == "ping":
             result = {}

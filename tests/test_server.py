@@ -638,7 +638,7 @@ async def test_messages_between_sessions(client):
         await send(client, tok, event("UserPromptSubmit", sid=sid, prompt=f"work {sid}"))
     # only machines with messaging on (they ask for their inbox) are listed or reachable
     assert [p["id"].split(":")[1] for p in (await call(a["token"], "a1", "DeckPeers")).json()["peers"]] == ["a1", "a2"]
-    await call(b["token"], "b1", "DeckInbox")
+    assert (await call(b["token"], "b1", "DeckInbox")).json()["wake"] is False  # nobody wrote to it, no room
     peers = (await call(a["token"], "a1", "DeckPeers")).json()
     assert {p["id"].split(":")[1] for p in peers["peers"]} == {"a1", "a2", "b1"}
     assert [p["you"] for p in peers["peers"] if p["id"].endswith(":a1")] == [True]
@@ -655,7 +655,9 @@ async def test_messages_between_sessions(client):
     # the board shows what waits for each session
     unread = {s["session_id"]: s["unread"] for s in (await board(client))["sessions"]}
     assert unread == {"a1": 1, "a2": 1, "b1": 2}  # nobody gets their own message
-    inbox = (await call(b["token"], "b1", "DeckInbox")).json()["messages"]
+    got = (await call(b["token"], "b1", "DeckInbox")).json()
+    inbox = got["messages"]
+    assert got["wake"] is True  # written to lately: worth waking while idle
     assert [m["text"] for m in inbox] == ["PR 73 ready for review", "to every Dubois session"]
     assert inbox[0]["from"].startswith('session "work a1" on Seismenos') and inbox[0]["ref"] == "https://git/pr/73"
     assert inbox[0]["from_id"] == f"{a['source']['id']}:a1" and inbox[0]["from_board"] is False

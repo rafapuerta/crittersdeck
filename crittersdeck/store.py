@@ -283,6 +283,11 @@ class Store:
             return self.db.execute("DELETE FROM room_members WHERE room_id = ? AND source_id = ? AND session_id = ?",
                                    (room_id, source_id, session_id)).rowcount > 0
 
+    def messaged_since(self, source_id, session_id, since):
+        """Whether any message for a session was posted since `since`."""
+        return self.db.execute(f"SELECT EXISTS (SELECT 1 FROM messages WHERE {self._FOR} AND created >= :since)",
+                               {"src": source_id, "sid": session_id, "since": since}).fetchone()[0] == 1
+
     def member_rooms(self, source_id, session_id):
         """Open rooms a session belongs to."""
         return [dict(r) for r in self.db.execute(

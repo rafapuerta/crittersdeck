@@ -32,7 +32,7 @@ def board():
                     time.sleep(0.02)
                 reply = {} if state["old"] else {"waiting": state["waiting"]}
             else:
-                reply, state["inbox"] = {"messages": state["inbox"]}, []
+                reply, state["inbox"] = {"messages": state["inbox"], **({"wake": state["wake"]} if "wake" in state else {})}, []
             self.send_response(200)
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
@@ -259,3 +259,10 @@ def test_wait_gives_up_on_a_session_the_board_forgot(tmp_path):
     out, _ = p.communicate(timeout=10)
     server.shutdown()
     assert p.returncode == 1 and "not on the board" in out and (tmp_path / "nowait-s1").exists()
+
+
+def test_stop_of_a_quiet_session_does_not_ask_for_wait(board, tmp_path):
+    url, state = board
+    state["wake"] = False  # in no room and nobody wrote to it lately: messages wait for its next prompt
+    assert hook(url, tmp_path, STOP) is None
+    assert not (tmp_path / "asked-s1").exists()

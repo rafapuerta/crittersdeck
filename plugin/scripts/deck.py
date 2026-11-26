@@ -5,7 +5,8 @@ Two ways to run it, both from the crittersdeck plugin:
   deck_rooms and deck_leave, for the session that started it. Token in DECK_TOKEN, switch in DECK_ON.
 - `deck.py hook <ingest_url> [data_dir]`: the delivery hook. On UserPromptSubmit it adds waiting messages
   to the prompt's context; on Stop it keeps the session going to read them, or, with none waiting and no
-  `wait` running, asks Claude once to start `wait` in the background. Prints nothing otherwise.
+  `wait` running, asks Claude once to start `wait` in the background (only for a session in a room or
+  messaged in the last hours: each wait costs a model turn when it ends). Prints nothing otherwise.
 - `deck.py wait <ingest_url> [data_dir]`: run by Claude in the background (Bash run_in_background). Waits
   until messages are waiting for the session, then exits with a short notice: the end of a background
   task wakes an idle session, which Claude Code does not do for hook-delivered messages. It reads the
@@ -203,7 +204,7 @@ def hook(url, data=""):
     status, body = call(url, token, session_id, "DeckInbox")
     messages = body.get("messages") if status == 200 else None
     if not messages:
-        if (stop and status == 200 and asked and not os.path.exists(asked) and not wait_alive(data, session_id)
+        if (stop and status == 200 and body.get("wake", True) and asked and not os.path.exists(asked) and not wait_alive(data, session_id)
                 and not os.path.exists(_file(data, "nowait", session_id))):
             save_token(data, token)
             with open(asked, "w", encoding="utf-8"):

@@ -32,6 +32,7 @@ from .store import Store
 
 ANSWER = "answer"  # answers to AskUserQuestion, from the board
 # Messages between sessions (the plugin's deck_* tools and its delivery hooks).
+WAKE_RECENT = 6 * 3600  # a session messaged this recently is kept awake by `deck.py wait`
 AGENT_EVENTS = ("DeckPeers", "DeckSend", "DeckInbox", "DeckWait", "DeckRooms", "DeckLeave")
 ROOMS_MAX, ROOM_MEMBERS_MAX, ROOM_NAME_MAX = 50, 30, 40
 WELCOME_NAMES = 10            # members named in the welcome notice
@@ -495,7 +496,11 @@ def create_apps(settings=None):
         if rows:
             broadcast()
         names = store.room_names()
-        return JSONResponse({"messages": [message_view(m, names) for m in rows]})
+        # Worth waking while idle: a room member, or a session someone wrote to lately. Others get their
+        # messages on their next prompt, so an idle session does not spend a model turn every wait.
+        wake = bool(store.member_rooms(sid, session_id)) or store.messaged_since(
+            sid, session_id, max(me["started"], time.time() - WAKE_RECENT))
+        return JSONResponse({"messages": [message_view(m, names) for m in rows], "wake": wake})
 
     async def waiting(source_id, session_id, since, wait):
         """How many messages wait for a session, without delivering them. With `wait` (seconds, capped),

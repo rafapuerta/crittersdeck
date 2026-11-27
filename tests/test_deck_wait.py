@@ -19,7 +19,7 @@ MSG = {"id": 1, "from": "peer", "from_id": "src:ab12", "to_kind": "session", "te
 def board():
     """A fake board: DeckWait answers `waiting` (or {} as an old board), holding the request while it is 0 like
     the real one; DeckInbox answers the inbox."""
-    state = {"inbox": [], "waiting": 0, "old": False, "calls": []}
+    state = {"inbox": [], "waiting": 0, "old": False, "calls": [], "in_room": True}
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -28,11 +28,11 @@ def board():
             name = body["hook_event_name"]
             if name == "DeckWait":
                 end = time.monotonic() + body.get("wait", 0)
-                while not state["waiting"] and not state["old"] and time.monotonic() < end:
+                while not state["waiting"] and not state["old"] and state["in_room"] and time.monotonic() < end:
                     time.sleep(0.02)
-                reply = {} if state["old"] else {"waiting": state["waiting"]}
+                reply = {} if state["old"] else {"waiting": state["waiting"], "in_room": state["in_room"]}
             else:
-                reply, state["inbox"] = {"messages": state["inbox"], **({"wake": state["wake"]} if "wake" in state else {})}, []
+                reply, state["inbox"] = {"messages": state["inbox"], "wake": state.get("wake", state["in_room"])}, []
             self.send_response(200)
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
@@ -263,6 +263,18 @@ def test_wait_gives_up_on_a_session_the_board_forgot(tmp_path):
 
 def test_stop_of_a_quiet_session_does_not_ask_for_wait(board, tmp_path):
     url, state = board
-    state["wake"] = False  # in no room and nobody wrote to it lately: messages wait for its next prompt
+    state["wake"] = False  # in no room: its messages wait for its next prompt, it never listens
     assert hook(url, tmp_path, STOP) is None
     assert not (tmp_path / "asked-s1").exists()
+
+
+def test_wait_stops_for_good_when_the_session_leaves_its_rooms(board, tmp_path):
+    url, state = board
+    (tmp_path / "token").write_text("cd_saved")
+    p = start_wait(url, tmp_path, tmp_path)
+    time.sleep(0.5)
+    assert p.poll() is None  # in a room: listening
+    state["in_room"] = False  # taken out of the room, or the room closed
+    out, _ = p.communicate(timeout=10)
+    assert p.returncode == 0 and "in no room" in out
+    assert hook(url, tmp_path, STOP) is None  # and the Stop hook does not ask again while it is in no room

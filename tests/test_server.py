@@ -657,7 +657,7 @@ async def test_messages_between_sessions(client):
     assert unread == {"a1": 1, "a2": 1, "b1": 2}  # nobody gets their own message
     got = (await call(b["token"], "b1", "DeckInbox")).json()
     inbox = got["messages"]
-    assert got["wake"] is True  # written to lately: worth waking while idle
+    assert got["wake"] is False  # direct messages wait for the next prompt: only a room member listens
     assert [m["text"] for m in inbox] == ["PR 73 ready for review", "to every Dubois session"]
     assert inbox[0]["from"].startswith('session "work a1" on Seismenos') and inbox[0]["ref"] == "https://git/pr/73"
     assert inbox[0]["from_id"] == f"{a['source']['id']}:a1" and inbox[0]["from_board"] is False
@@ -699,21 +699,33 @@ async def test_wait_counts_without_delivering_and_long_polls(client):
         await send(client, a["token"], event("UserPromptSubmit", sid=sid, prompt="p"))
     call = lambda sid, name, **kw: send(client, a["token"], {"hook_event_name": name, "session_id": sid, **kw})
     await call("y", "DeckInbox")
-    assert (await call("y", "DeckWait")).json() == {"waiting": 0}  # no wait: answers at once
-    # held until a message arrives, then answers with the count
+    src = a["source"]["id"]
+    # in no room: not listening, answered at once even when asked to hold
+    assert (await asyncio.wait_for(call("y", "DeckWait", wait=30), 2)).json() == {"waiting": 0, "in_room": False}
+    room = (await client.post("/api/rooms", json={"name": "R", "members": [f"{src}:x", f"{src}:y"]})).json()["id"]
+    await call("y", "DeckInbox")  # the welcome
+    assert (await call("y", "DeckWait")).json() == {"waiting": 0, "in_room": True}  # no wait: answers at once
+    # held until a room message arrives, then answers with the count; a direct message does not wake it
     held = asyncio.create_task(call("y", "DeckWait", wait=30))
     await asyncio.sleep(0.1)
+    await call("x", "DeckSend", to=f"{src}:y", text="direct")
+    await asyncio.sleep(0.1)
     assert not held.done()
-    await call("x", "DeckSend", to=f"{a['source']['id']}:y", text="hi")
-    assert (await asyncio.wait_for(held, 5)).json() == {"waiting": 1}
-    assert (await call("y", "DeckWait", wait=30)).json() == {"waiting": 1}  # still there: not delivered
-    assert len((await call("y", "DeckInbox")).json()["messages"]) == 1
+    await call("x", "DeckSend", to=f"room:{room}", text="hi")
+    assert (await asyncio.wait_for(held, 5)).json() == {"waiting": 1, "in_room": True}
+    assert len((await call("y", "DeckInbox")).json()["messages"]) == 2  # counted, not delivered: both still there
     for odd in (-5, "10", True, None):  # bad values mean no wait
-        assert (await asyncio.wait_for(call("y", "DeckWait", wait=odd), 2)).json() == {"waiting": 0}
+        assert (await asyncio.wait_for(call("y", "DeckWait", wait=odd), 2)).json() == {"waiting": 0, "in_room": True}
     for raw in (b"NaN", b"-Infinity"):  # json.loads takes them; NaN would hold the request forever
         body = b'{"hook_event_name": "DeckWait", "session_id": "y", "wait": ' + raw + b"}"
         r = await asyncio.wait_for(client.post("/ingest", content=body, headers={"authorization": f"Bearer {a['token']}"}), 2)
-        assert r.json() == {"waiting": 0}
+        assert r.json() == {"waiting": 0, "in_room": True}
+    # taken out of the room: a held wait ends at once, and listening stops
+    held = asyncio.create_task(call("y", "DeckWait", wait=30))
+    await asyncio.sleep(0.1)
+    assert (await client.delete(f"/api/rooms/{room}/members/{src}/y")).status_code == 200
+    assert (await asyncio.wait_for(held, 5)).json() == {"waiting": 0, "in_room": False}
+    assert (await call("y", "DeckInbox")).json()["wake"] is False
 
 
 async def test_wait_is_capped(client, monkeypatch):
@@ -723,15 +735,18 @@ async def test_wait_is_capped(client, monkeypatch):
     await sign_in(client)
     a = await new_source(client, "A")
     await send(client, a["token"], event("UserPromptSubmit", sid="y", prompt="p"))
+    await send(client, a["token"], {"hook_event_name": "DeckInbox", "session_id": "y"})
+    await client.post("/api/rooms", json={"name": "R", "members": [f"{a['source']['id']}:y"]})
+    await send(client, a["token"], {"hook_event_name": "DeckInbox", "session_id": "y"})  # the welcome
     r = await asyncio.wait_for(send(client, a["token"], {"hook_event_name": "DeckWait", "session_id": "y", "wait": 3600}), 3)
-    assert r.json() == {"waiting": 0}
+    assert r.json() == {"waiting": 0, "in_room": True}
     monkeypatch.setattr(server, "WAIT_MAX", 30)
     monkeypatch.setattr(server, "MAX_SESSIONS_PER_SOURCE", 1)
     held = asyncio.create_task(send(client, a["token"], {"hook_event_name": "DeckWait", "session_id": "y", "wait": 30}))
     await asyncio.sleep(0.1)
     # one held per session is the most the plugin needs: past the per-source cap, answered at once
     r = await asyncio.wait_for(send(client, a["token"], {"hook_event_name": "DeckWait", "session_id": "y", "wait": 30}), 2)
-    assert r.json() == {"waiting": 0} and not held.done()
+    assert r.json() == {"waiting": 0, "in_room": True} and not held.done()
     held.cancel()
 
 
@@ -834,13 +849,13 @@ async def test_room_posts_from_agents_do_not_wake_a_member_twice_in_a_row(client
     room = (await client.post("/api/rooms", json={"name": "R", "members": [ids["a1"], ids["b1"]]})).json()["id"]
     await call("b1", "DeckInbox")
     await call("a1", "DeckSend", to=f"room:{room}", text="one")
-    assert (await call("b1", "DeckWait")).json() == {"waiting": 1}  # wakes, and starts the cooldown
+    assert (await call("b1", "DeckWait")).json() == {"waiting": 1, "in_room": True}  # wakes, and starts the cooldown
     await call("b1", "DeckInbox")
     await call("a1", "DeckSend", to=f"room:{room}", text="two")
-    assert (await call("b1", "DeckWait")).json() == {"waiting": 0}  # an agent again, too soon: waits for the next turn
+    assert (await call("b1", "DeckWait")).json() == {"waiting": 0, "in_room": True}  # an agent again, too soon: waits for the next turn
     assert len((await call("b1", "DeckInbox")).json()["messages"]) == 1  # still delivered
     await client.post(f"/api/rooms/{room}/messages", json={"text": "from Rafa"})
-    assert (await call("b1", "DeckWait")).json() == {"waiting": 1}  # the board always wakes
+    assert (await call("b1", "DeckWait")).json() == {"waiting": 1, "in_room": True}  # the board always wakes
 
 
 async def test_room_members_go_with_their_sessions(client, app):

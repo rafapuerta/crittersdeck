@@ -204,7 +204,7 @@ def hook(url, data=""):
     status, body = call(url, token, session_id, "DeckInbox")
     messages = body.get("messages") if status == 200 else None
     if not messages:
-        if (stop and status == 200 and body.get("wake", True) and asked and not os.path.exists(asked) and not wait_alive(data, session_id)
+        if (stop and status == 200 and body.get("wake") is True and asked and not os.path.exists(asked) and not wait_alive(data, session_id)
                 and not os.path.exists(_file(data, "nowait", session_id))):
             save_token(data, token)
             with open(asked, "w", encoding="utf-8"):
@@ -364,6 +364,11 @@ def wait(url, data=""):
                 return give_up(failure(status, body))
             if status == 200 and "waiting" not in body:
                 return give_up("this board is too old to wait for messages (update it)")
+            if status == 200 and body.get("in_room") is False:
+                # taken out of every room, or the room was closed: listening ends for good (the hook asks
+                # again only if the session is put in a room)
+                print("crittersdeck wait: this session is in no room any more; stopped listening.")
+                return 0
             if status == 200:
                 _remove(_file(data, "asked", session_id))  # running: a later stop, after it ends, may ask again
             n = body.get("waiting") if status == 200 else 0

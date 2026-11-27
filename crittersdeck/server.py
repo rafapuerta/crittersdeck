@@ -32,7 +32,6 @@ from .store import Store
 
 ANSWER = "answer"  # answers to AskUserQuestion, from the board
 # Messages between sessions (the plugin's deck_* tools and its delivery hooks).
-WAKE_RECENT = 6 * 3600  # a session messaged this recently is kept awake by `deck.py wait`
 AGENT_EVENTS = ("DeckPeers", "DeckSend", "DeckInbox", "DeckWait", "DeckRooms", "DeckLeave")
 ROOMS_MAX, ROOM_MEMBERS_MAX, ROOM_NAME_MAX = 50, 30, 40
 WELCOME_NAMES = 10            # members named in the welcome notice
@@ -491,20 +490,21 @@ def create_apps(settings=None):
             broadcast()
             return JSONResponse({"left": True})
         if name == "DeckWait":
-            return JSONResponse({"waiting": await waiting(sid, session_id, me["started"], event.get("wait"))})
+            n = await waiting(sid, session_id, me["started"], event.get("wait"))
+            return JSONResponse({"waiting": n or 0, "in_room": n is not None})
         rows = store.inbox(sid, session_id, me["started"], max_chars=DELIVERY_CHARS)
         if rows:
             broadcast()
         names = store.room_names()
-        # Worth waking while idle: a room member, or a session someone wrote to lately. Others get their
-        # messages on their next prompt, so an idle session does not spend a model turn every wait.
-        wake = bool(store.member_rooms(sid, session_id)) or store.messaged_since(
-            sid, session_id, max(me["started"], time.time() - WAKE_RECENT))
+        # Only a room member listens while idle (messages between sessions happen in rooms); anyone else gets
+        # its messages on its next prompt, so an idle session never spends a model turn on an empty wait.
+        wake = bool(store.member_rooms(sid, session_id))
         return JSONResponse({"messages": [message_view(m, names) for m in rows], "wake": wake})
 
     async def waiting(source_id, session_id, since, wait):
-        """How many messages wait for a session, without delivering them. With `wait` (seconds, capped),
-        holds the request until there is at least one or the time is up (long-poll for `deck.py wait`)."""
+        """How many room messages wait for a session, without delivering them. With `wait` (seconds, capped),
+        holds the request until there is at least one or the time is up (long-poll for `deck.py wait`).
+        None when the session is in no open room: removed, or its room closed, it stops listening."""
         key = (source_id, session_id)
         ok = isinstance(wait, (int, float)) and not isinstance(wait, bool) and math.isfinite(wait)  # NaN would hold forever
         wait = min(max(wait, 0), WAIT_MAX) if ok else 0
@@ -516,7 +516,9 @@ def create_apps(settings=None):
         held[source_id] = held.get(source_id, 0) + 1
         try:
             while True:
-                rows = store.pending(source_id, session_id, since)
+                if not store.member_rooms(source_id, session_id):
+                    return None
+                rows = [r for r in store.pending(source_id, session_id, since) if r[0]]  # only rooms wake
                 now = time.time()
                 # Agents in a room answering each other: a room wakes a member at most every WAKE_COOLDOWN s,
                 # and after ROOM_AGENT_WAKES wakes from agents' posts it wakes nobody until the board posts.

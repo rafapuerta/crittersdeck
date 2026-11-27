@@ -1,6 +1,6 @@
 {
   "name": "crittersdeck",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Report this machine's Claude Code sessions to a crittersdeck board, answer permission prompts and questions from the board, send each session's title and usage, and let sessions on different machines message each other.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/rafapuerta/crittersdeck",
